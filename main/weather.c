@@ -111,32 +111,32 @@ static void wmo_desc(int code, char *out, size_t n)
 {
     const char *s;
     switch (code) {
-        case 0:  s = "Clear"; break;
-        case 1:  s = "Mainly clear"; break;
-        case 2:  s = "Partly cloudy"; break;
-        case 3:  s = "Overcast"; break;
-        case 45: s = "Fog"; break;
-        case 48: s = "Rime fog"; break;
-        case 51: s = "Light drizzle"; break;
-        case 53: s = "Moderate drizzle"; break;
-        case 55: s = "Dense drizzle"; break;
-        case 56: case 57: s = "Freezing drizzle"; break;
-        case 61: s = "Light rain"; break;
-        case 63: s = "Moderate rain"; break;
-        case 65: s = "Heavy rain"; break;
-        case 66: case 67: s = "Freezing rain"; break;
-        case 71: s = "Light snow"; break;
-        case 73: s = "Moderate snow"; break;
-        case 75: s = "Heavy snow"; break;
-        case 77: s = "Snow grains"; break;
-        case 80: s = "Light showers"; break;
-        case 81: s = "Moderate showers"; break;
-        case 82: s = "Violent showers"; break;
-        case 85: s = "Light snow showers"; break;
-        case 86: s = "Heavy snow showers"; break;
-        case 95: s = "Thunderstorm"; break;
-        case 96: case 99: s = "Thunderstorm, hail"; break;
-        default: s = "Unknown"; break;
+        case 0:  s = "晴"; break;
+        case 1:  s = "少云"; break;
+        case 2:  s = "多云"; break;
+        case 3:  s = "阴"; break;
+        case 45: s = "雾"; break;
+        case 48: s = "雾凇"; break;
+        case 51: s = "毛毛雨"; break;
+        case 53: s = "细雨"; break;
+        case 55: s = "密集细雨"; break;
+        case 56: case 57: s = "冻毛雨"; break;
+        case 61: s = "小雨"; break;
+        case 63: s = "中雨"; break;
+        case 65: s = "大雨"; break;
+        case 66: case 67: s = "冻雨"; break;
+        case 71: s = "小雪"; break;
+        case 73: s = "中雪"; break;
+        case 75: s = "大雪"; break;
+        case 77: s = "米雪"; break;
+        case 80: s = "小阵雨"; break;
+        case 81: s = "中阵雨"; break;
+        case 82: s = "暴雨"; break;
+        case 85: s = "小阵雪"; break;
+        case 86: s = "强阵雪"; break;
+        case 95: s = "雷阵雨"; break;
+        case 96: case 99: s = "雷阵雨伴冰雹"; break;
+        default: s = "未知"; break;
     }
     strncpy(out, s, n - 1);
     out[n - 1] = '\0';
@@ -353,7 +353,7 @@ static void weather_task(void *arg)
 void weather_init(void)
 {
     s_req_sem = xSemaphoreCreateBinary();
-    xTaskCreate(weather_task, "weather", 10240, NULL, 3, NULL);
+    xTaskCreate(weather_task, "weather", 16384, NULL, 3, NULL);
 }
 
 void weather_request(const char *city)

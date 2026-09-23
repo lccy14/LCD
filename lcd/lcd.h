@@ -1,33 +1,35 @@
 #ifndef __LCD_H
 #define __LCD_H		
 #include "sys.h"
-#include "lcd_init.h"   // ÒıÈë LCD_W / LCD_H / USE_HORIZONTAL µÈ¶¨Òå
-#include "esp_attr.h"   // EXT_RAM_BSS_ATTR£º°ÑÖ¡»º³å·Å½ø PSRAM£¬Ê¡³öÄÚ²¿ DRAM
+#include "lcd_init.h"   // æä¾› LCD_W / LCD_H / USE_HORIZONTAL ç­‰å¸¸é‡
+#include "esp_attr.h"   // EXT_RAM_BSS_ATTRï¼ŒæŠŠå¸§ç¼“å†²æ”¾åˆ° PSRAMï¼ŒèŠ‚çœå†…éƒ¨ DRAM
+#include "esp_lcd_panel_ops.h"
 
-// Ö¡»º³å£¨framebuffer£©£ºËùÓĞ»æÖÆÖ»¸ÄÄÚ´æ£¬×îºóÍ³Ò» flush µ½ÆÁÄ»¡£
-// ±ê EXT_RAM_BSS_ATTR ºóÓÉÁ´½ÓÆ÷°áµ½ PSRAM£¨Ğè CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY£©£¬
-// ·ñÔò 150KB »á¼·±¬ÄÚ²¿ DRAM£»ESP32-S3 µÄ SPI DMA ¿É·ÃÎÊ PSRAM£¬Ë¢ÆÁ²»ÊÜÓ°Ïì¡£
+// å¸§ç¼“å†²ï¼ˆframebufferï¼‰â€”â€”æ‰€æœ‰ç»˜å›¾æ“ä½œéƒ½åªæ”¹å†…å­˜ï¼Œç»Ÿä¸€ flush åˆ°å±å¹•ã€‚
+// EXT_RAM_BSS_ATTR ä¼šæ”¾åˆ° PSRAMï¼ˆçº¦ 150KBï¼‰ï¼ŒLCD_CAM DMA å¯ç›´æ¥è®¿é—® PSRAMã€‚
 extern u8 g_framebuffer[LCD_W * LCD_H * 2];
 
-void LCD_Flush(u16 x1, u16 y1, u16 x2, u16 y2);   // °Ñ»º³åÖ¸¶¨ÇøÓò DMA Ë¢µ½ÆÁÄ»
-void LCD_Flush_All(void);                          // È«ÆÁË¢ĞÂ
+// esp_lcd panel å¥æŸ„ï¼Œç”± lcd_init.c åˆå§‹åŒ–
+extern esp_lcd_panel_handle_t g_lcd_panel;
 
-void LCD_Fill(u16 xsta,u16 ysta,u16 xend,u16 yend,u16 color);//Ö¸¶¨ÇøÓòÌî³äÑÕÉ«£¨Ğ´»º³å£©
-void LCD_DrawPoint(u16 x,u16 y,u16 color);//ÔÚÖ¸¶¨Î»ÖÃ»­Ò»¸öµã£¨Ğ´»º³å£©
-void LCD_DrawLine(u16 x1,u16 y1,u16 x2,u16 y2,u16 color);//ÔÚÖ¸¶¨Î»ÖÃ»­Ò»ÌõÏß
-void LCD_DrawRectangle(u16 x1, u16 y1, u16 x2, u16 y2,u16 color);//ÔÚÖ¸¶¨Î»ÖÃ»­Ò»¸ö¾ØĞÎ
-void Draw_Circle(u16 x0,u16 y0,u8 r,u16 color);//ÔÚÖ¸¶¨Î»ÖÃ»­Ò»¸öÔ²
+void LCD_Flush(u16 x1, u16 y1, u16 x2, u16 y2);   // å±€éƒ¨åŒºåŸŸ DMA åˆ·æ–°
+void LCD_Flush_All(void);                          // å…¨å±åˆ·æ–°
 
-void LCD_ShowChar(u16 x,u16 y,u8 num,u16 fc,u16 bc,u8 sizey,u8 mode);//ÏÔÊ¾Ò»¸ö×Ö·û
-void LCD_ShowString(u16 x,u16 y,const u8 *p,u16 fc,u16 bc,u8 sizey,u8 mode);//ÏÔÊ¾×Ö·û´®
-u32 mypow(u8 m,u8 n);//ÇóÃİ
-void LCD_ShowIntNum(u16 x,u16 y,u16 num,u8 len,u16 fc,u16 bc,u8 sizey);//ÏÔÊ¾ÕûÊı±äÁ¿
-void LCD_ShowFloatNum1(u16 x,u16 y,float num,u8 len,u16 fc,u16 bc,u8 sizey);//ÏÔÊ¾Á½Î»Ğ¡Êı±äÁ¿
+void LCD_Fill(u16 xsta,u16 ysta,u16 xend,u16 yend,u16 color);// æŒ‡å®šåŒºåŸŸå¡«å……é¢œè‰²ï¼ˆå†™å¸§ç¼“å†²ï¼‰
+void LCD_DrawPoint(u16 x,u16 y,u16 color);// åœ¨æŒ‡å®šä½ç½®ç”»ä¸€ä¸ªç‚¹ï¼ˆå†™å¸§ç¼“å†²ï¼‰
+void LCD_DrawLine(u16 x1,u16 y1,u16 x2,u16 y2,u16 color);// åœ¨æŒ‡å®šä½ç½®ç”»ä¸€æ¡çº¿
+void LCD_DrawRectangle(u16 x1, u16 y1, u16 x2, u16 y2,u16 color);// åœ¨æŒ‡å®šä½ç½®ç”»ä¸€ä¸ªçŸ©å½¢
+void Draw_Circle(u16 x0,u16 y0,u8 r,u16 color);// åœ¨æŒ‡å®šä½ç½®ç”»ä¸€ä¸ªåœ†
 
-void LCD_ShowPicture(u16 x,u16 y,u16 length,u16 width,const u8 pic[]);//ÏÔÊ¾Í¼Æ¬
+void LCD_ShowChar(u16 x,u16 y,u8 num,u16 fc,u16 bc,u8 sizey,u8 mode);// æ˜¾ç¤ºä¸€ä¸ªå­—ç¬¦
+void LCD_ShowString(u16 x,u16 y,const u8 *p,u16 fc,u16 bc,u8 sizey,u8 mode);// æ˜¾ç¤ºå­—ç¬¦ä¸²
+u32 mypow(u8 m,u8 n);//ä¹˜æ–¹
+void LCD_ShowIntNum(u16 x,u16 y,u16 num,u8 len,u16 fc,u16 bc,u8 sizey);// æ˜¾ç¤ºæ•´æ•°
+void LCD_ShowFloatNum1(u16 x,u16 y,float num,u8 len,u16 fc,u16 bc,u8 sizey);// æ˜¾ç¤ºä¸¤ä½å°æ•°
 
+void LCD_ShowPicture(u16 x,u16 y,u16 length,u16 width,const u8 pic[]);// æ˜¾ç¤ºå›¾ç‰‡
 
-//»­±ÊÑÕÉ«
+// å¸¸ç”¨é¢œè‰²
 #define WHITE         	 0xFFFF
 #define BLACK         	 0x0000	  
 #define BLUE           	 0x001F  
@@ -39,15 +41,15 @@ void LCD_ShowPicture(u16 x,u16 y,u16 length,u16 width,const u8 pic[]);//ÏÔÊ¾Í¼Æ¬
 #define GREEN         	 0x07E0
 #define CYAN          	 0x7FFF
 #define YELLOW        	 0xFFE0
-#define BROWN 			     0XBC40 //×ØÉ«
-#define BRRED 			     0XFC07 //×ØºìÉ«
-#define GRAY  			     0X8430 //»ÒÉ«
-#define DARKBLUE      	 0X01CF	//ÉîÀ¶É«
-#define LIGHTBLUE      	 0X7D7C	//Ç³À¶É«  
-#define GRAYBLUE       	 0X5458 //»ÒÀ¶É«
-#define LIGHTGREEN     	 0X841F //Ç³ÂÌÉ«
-#define LGRAY 			     0XC618 //Ç³»ÒÉ«(PANNEL),´°Ìå±³¾°É«
-#define LGRAYBLUE        0XA651 //Ç³»ÒÀ¶É«(ÖĞ¼ä²ãÑÕÉ«)
-#define LBBLUE           0X2B12 //Ç³×ØÀ¶É«(Ñ¡ÔñÌõÄ¿µÄ·´É«)
+#define BROWN 			     0XBC40 //æ£•è‰²
+#define BRRED 			     0XFC07 //æ£•çº¢è‰²
+#define GRAY  			     0X8430 //ç°è‰²
+#define DARKBLUE      	 0X01CF	//æ·±è“è‰²
+#define LIGHTBLUE      	 0X7D7C	//æµ…è“è‰²  
+#define GRAYBLUE       	 0X5458 //ç°è“è‰²
+#define LIGHTGREEN     	 0X841F //æµ…ç»¿è‰²
+#define LGRAY 			     0XC618 //æµ…ç°è‰²(PANNEL),çª—ä½“èƒŒæ™¯è‰²
+#define LGRAYBLUE        0XA651 //æµ…ç°è“è‰²(ä¸­é—´å±‚é¢œè‰²)
+#define LBBLUE           0X2B12 //æµ…æ£•è“è‰²(é€‰ä¸­é¡¹çš„èƒŒæ™¯è‰²)
 
 #endif

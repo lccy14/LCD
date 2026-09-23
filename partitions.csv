@@ -1,0 +1,13 @@
+# ESP32-S3 分区表（8MB Flash）
+#
+# factory 放大到 6MB：给中文字库（完整 CJK 基本区 16px/bpp4 约 2.8MB）留出空间。
+# storage 为预留的 1.94MB，后续做「看小说」功能时用来存放文本（挂载 SPIFFS/LittleFS），
+# 目前尚未使用，不影响编译和运行。
+#
+# nvs / phy_init 的偏移与大小保持与原表一致，避免 NVS 数据（WiFi 密码等）错位。
+#
+# Name,     Type, SubType, Offset,     Size,       Flags
+nvs,        data, nvs,     0x9000,     0x6000,
+phy_init,   data, phy,     0xf000,     0x1000,
+factory,    app,  factory, 0x10000,    0x600000,
+storage,    data, spiffs,  0x610000,   0x1F0000,

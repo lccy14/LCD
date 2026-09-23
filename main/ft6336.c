@@ -9,17 +9,22 @@ static const char *TAG = "FT6336";
 static i2c_master_bus_handle_t s_bus = NULL;
 static i2c_master_dev_handle_t s_dev = NULL;
 
+/* I2C 超时：不能用 -1（无限等待）。
+ * 触摸读取跑在 LVGL 任务里，一旦总线异常/设备掉线，无限等待会直接冻死整个 UI 与触摸。
+ * 限时失败后本次读取作废，下个周期重试，最坏情况只是丢一帧坐标。 */
+#define FT6336_I2C_TIMEOUT pdMS_TO_TICKS(20)
+
 /* 向 FT6336 写一个寄存器（用于读之前设置寄存器地址） */
 static esp_err_t ft6336_write_reg(uint8_t reg, uint8_t val)
 {
     uint8_t buf[2] = { reg, val };
-    return i2c_master_transmit(s_dev, buf, sizeof(buf), -1);
+    return i2c_master_transmit(s_dev, buf, sizeof(buf), FT6336_I2C_TIMEOUT);
 }
 
 /* 从 FT6336 读 len 个字节，起始寄存器为 reg */
 static esp_err_t ft6336_read_reg(uint8_t reg, uint8_t *buf, size_t len)
 {
-    return i2c_master_transmit_receive(s_dev, &reg, 1, buf, len, -1);
+    return i2c_master_transmit_receive(s_dev, &reg, 1, buf, len, FT6336_I2C_TIMEOUT);
 }
 
 esp_err_t ft6336_init(void)
@@ -52,14 +57,17 @@ esp_err_t ft6336_init(void)
     i2c_device_config_t dev_cfg = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
         .device_address  = FT6336_I2C_ADDR,
-        .scl_speed_hz    = 100000,
+        /* FT6336 支持 400kHz 快速模式；100kHz 时单次读 5 字节约 0.9ms，
+         * 提到 400kHz 后约 0.25ms，直接省掉每帧 0.65ms 的 I2C 时间。 */
+        .scl_speed_hz    = 400000,
     };
     if (i2c_master_bus_add_device(s_bus, &dev_cfg, &s_dev) != ESP_OK) {
         ESP_LOGE(TAG, "add device 0x%02X failed", FT6336_I2C_ADDR);
         return ESP_ERR_NOT_FOUND;
     }
     uint8_t id[2] = {0};
-    if (i2c_master_transmit_receive(s_dev, (uint8_t[]){0xA8}, 1, id, 2, -1) == ESP_OK) {
+    if (i2c_master_transmit_receive(s_dev, (uint8_t[]){0xA8}, 1, id, 2,
+                                    FT6336_I2C_TIMEOUT) == ESP_OK) {
         ESP_LOGI(TAG, "FT6336 found at addr 0x%02X, chip_id=%02X%02X",
                  FT6336_I2C_ADDR, id[0], id[1]);
     } else {
@@ -109,10 +117,18 @@ esp_err_t ft6336_read(touch_point_t *tp)
     uint16_t x = (uint16_t)(((xh & 0x0F) << 8) | xl);
     uint16_t y = (uint16_t)(((yh & 0x0F) << 8) | yl);
 
-    ESP_LOGI(TAG, "touch detected x=%d y=%d", x, y);
+    /* 用 D 级别：I 级别会在手指按住期间每秒刷 30 条串口日志，拖慢主循环 */
+    ESP_LOGD(TAG, "touch detected x=%d y=%d", x, y);
 
     tp->pressed = true;
     tp->x = x;
     tp->y = y;
     return ESP_OK;
+}
+
+/* 查 INT 引脚电平, 无触摸时高电平, 触摸中低电平(FT6336 默认配置)。
+ * touch_read_cb 用它快速过滤, 无触摸时不读 I2C, 滑动响应延迟从 ~1ms 降到 ~1µs。 */
+bool ft6336_touched(void)
+{
+    return gpio_get_level(FT6336_INT_GPIO) == 0;
 }

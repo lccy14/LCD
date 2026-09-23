@@ -3,8 +3,9 @@
 
 #include "sys.h"
 #include "driver/gpio.h"
+#include "esp_lcd_panel_io.h"   /* esp_lcd_panel_io_handle_t / esp_lcd_panel_io_event_data_t */
 
-#define USE_HORIZONTAL 2  // ST7789 1.14´ç ºáÆÁÏÔÊ¾£¨2/3 ÎªºáÆÁ£©
+#define USE_HORIZONTAL 2  // ST7789 1.14å¯¸ï¼Œå½“å‰æ¨ªå±æ˜¾ç¤ºæ¨¡å¼ 2/3 ä¸ºæ¨ªå±
 
 #if USE_HORIZONTAL==0||USE_HORIZONTAL==1
 #define LCD_W 240
@@ -14,35 +15,50 @@
 #define LCD_H 240
 #endif
 
-//-----------------LCD Òı½Å¶¨Òå (ESP32 GPIO)----------------
-// ÓÃ»§¿É¸ù¾İÊµ¼Ê½ÓÏßĞŞ¸ÄÒÔÏÂÒı½ÅºÅ
-#define LCD_SCLK_GPIO   GPIO_NUM_5  // SCLK
-#define LCD_MOSI_GPIO   GPIO_NUM_6  // MOSI
-#define LCD_RES_GPIO    GPIO_NUM_19   // RES
-#define LCD_DC_GPIO     GPIO_NUM_3   // DC
-#define LCD_CS_GPIO     GPIO_NUM_20   // CS
-#define LCD_BLK_GPIO    GPIO_NUM_8  // BLK
+//-----------------LCD å¹¶è¡Œ 8bit æ¥å£å¼•è„š (ESP32-S3 GPIO)----------------
+// æŒ‰ç”¨æˆ·æŒ‡å®šæ¥çº¿ï¼šST7789 å¹¶è¡Œ 8bit æ¥å£
+#define LCD_CS_GPIO     GPIO_NUM_37  // ç‰‡é€‰
+#define LCD_DC_GPIO     GPIO_NUM_35  // æ•°æ®/å‘½ä»¤ (RS)
+#define LCD_WR_GPIO     GPIO_NUM_36  // å†™æ—¶é’Ÿ (PCLK)
+#define LCD_RST_GPIO    GPIO_NUM_21  // å¤ä½
+#define LCD_BLK_GPIO    GPIO_NUM_38  // èƒŒå…‰
 
-// ºê¶¨Òå£ºÉèÖÃ/Çå³ıµçÆ½£¨SCLK/MOSI ÓÉÓ²¼ş SPI ¹ÜÀí£¬²»ÔÙÊ¹ÓÃÎ»´øºê£©
-#define LCD_RES_Clr()   gpio_set_level(LCD_RES_GPIO, 0)
-#define LCD_RES_Set()   gpio_set_level(LCD_RES_GPIO, 1)
+// 8bit æ•°æ®æ€»çº¿ï¼ˆD0-D7ï¼‰
+#define LCD_D0_GPIO     GPIO_NUM_6   // D0
+#define LCD_D1_GPIO     GPIO_NUM_7   // D1
+#define LCD_D2_GPIO     GPIO_NUM_17  // D2
+#define LCD_D3_GPIO     GPIO_NUM_18  // D3
+#define LCD_D4_GPIO     GPIO_NUM_8   // D4
+#define LCD_D5_GPIO     GPIO_NUM_19  // D5
+#define LCD_D6_GPIO     GPIO_NUM_20  // D6
+#define LCD_D7_GPIO     GPIO_NUM_3   // D7
 
-#define LCD_DC_Clr()    gpio_set_level(LCD_DC_GPIO, 0)
-#define LCD_DC_Set()    gpio_set_level(LCD_DC_GPIO, 1)
+// RD å¼•è„šåœ¨å¹¶å£åªè¯»å±å¹•ä¸Šå¿…é¡»æ¥ 3.3Vï¼Œè½¯ä»¶ä¸æ§åˆ¶
 
-#define LCD_CS_Clr()    gpio_set_level(LCD_CS_GPIO, 0)
-#define LCD_CS_Set()    gpio_set_level(LCD_CS_GPIO, 1)
+// æ§åˆ¶å®ï¼ˆä¿ç•™å…¼å®¹ï¼Œæ–¹ä¾¿å…¶ä»–æ–‡ä»¶ç›´æ¥æ“ä½œï¼‰
+#define LCD_CS_Clr()   gpio_set_level(LCD_CS_GPIO, 0)
+#define LCD_CS_Set()   gpio_set_level(LCD_CS_GPIO, 1)
+#define LCD_DC_Clr()   gpio_set_level(LCD_DC_GPIO, 0)
+#define LCD_DC_Set()   gpio_set_level(LCD_DC_GPIO, 1)
+#define LCD_WR_Clr()   gpio_set_level(LCD_WR_GPIO, 0)
+#define LCD_WR_Set()   gpio_set_level(LCD_WR_GPIO, 1)
+#define LCD_RST_Clr()  gpio_set_level(LCD_RST_GPIO, 0)
+#define LCD_RST_Set()  gpio_set_level(LCD_RST_GPIO, 1)
+#define LCD_BLK_Clr()  gpio_set_level(LCD_BLK_GPIO, 0)
+#define LCD_BLK_Set()  gpio_set_level(LCD_BLK_GPIO, 1)
 
-#define LCD_BLK_Clr()   gpio_set_level(LCD_BLK_GPIO, 0)
-#define LCD_BLK_Set()   gpio_set_level(LCD_BLK_GPIO, 1)
+void LCD_GPIO_Init(void);                // åˆå§‹åŒ– GPIO + I80 å¹¶è¡Œæ€»çº¿
+void LCD_Writ_Bus(u8 dat);               // å¹¶å£å†™ä¸€ä¸ªå­—èŠ‚ï¼ˆè°ƒè¯•ç”¨ï¼‰
+void LCD_Writ_Buf(const u8 *data, u32 len); // å¹¶å£æ‰¹é‡å†™ï¼ˆDMAï¼‰
+void LCD_WR_DATA8(u8 dat);               // å†™ä¸€ä¸ªå­—èŠ‚æ•°æ®
+void LCD_WR_DATA(u16 dat);               // å†™ä¸¤ä¸ªå­—èŠ‚æ•°æ®
+void LCD_WR_REG(u8 dat);                 // å†™ä¸€ä¸ªå‘½ä»¤
+void LCD_Address_Set(u16 x1,u16 y1,u16 x2,u16 y2); // è®¾ç½®æ˜¾ç¤ºåŒºåŸŸ
+void LCD_Init(void);                     // LCD åˆå§‹åŒ–
 
-void LCD_GPIO_Init(void);                // ³õÊ¼»¯ GPIO + SPI ¿ØÖÆÆ÷
-void LCD_Writ_Bus(u8 dat);               // SPI Ğ´ÈëÒ»¸ö×Ö½Ú
-void LCD_Writ_Buf(const u8 *data, u32 len); // ÅúÁ¿Êı¾İĞ´Èë£¨DMA£©
-void LCD_WR_DATA8(u8 dat);               // Ğ´ÈëÒ»¸ö×Ö½Ú
-void LCD_WR_DATA(u16 dat);               // Ğ´ÈëÁ½¸ö×Ö½Ú
-void LCD_WR_REG(u8 dat);                 // Ğ´ÈëÒ»¸öÖ¸Áî
-void LCD_Address_Set(u16 x1,u16 y1,u16 x2,u16 y2); // ÉèÖÃ×ø±êº¯Êı
-void LCD_Init(void);                     // LCD ³õÊ¼»¯
+/* æ³¨å†Œ I80 é¢œè‰²ä¼ è¾“å®Œæˆå›è°ƒï¼ˆDMA åˆ·å±å®Œæˆæ—¶è°ƒç”¨ï¼ŒISR ä¸Šä¸‹æ–‡ï¼‰ã€‚
+ * ä¸Šå±‚ï¼ˆLVGLï¼‰ç”¨å®ƒæ¥è°ƒ lv_disp_flush_readyï¼Œè®© LVGL çŸ¥é“å¯ä»¥æ¸²æŸ“ä¸‹ä¸€å¸§ã€‚
+ * å¿…é¡»åœ¨ LCD_Init() ä¹‹å‰è°ƒç”¨ã€‚*/
+void lcd_set_color_trans_done_cb(bool (*cb)(esp_lcd_panel_io_handle_t, esp_lcd_panel_io_event_data_t *, void *), void *ctx);
 
 #endif
