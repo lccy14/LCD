@@ -21,7 +21,10 @@
 #include "esp_timer.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"   /* heap_caps_malloc PSRAM for prerender_home_bg */
+#include "snake.h"            /* 贪吃蛇 */
 #include "novel_text.h"
+#include "file_mgr.h"         /* 文件管理（SD 卡 / SDMMC + FATFS） */
+#include "media.h"            /* 图片查看 / MJPEG 视频播放 */
 
 /* LVGL 主任务句柄, 供 lvgl_port.c 的 DMA 完成中断回调 xTaskNotifyGive 唤醒主循环。
  * 替代 vTaskDelay 固定 10ms 等待: DMA 完成立刻唤醒, 滑动 FPS 46→80+。 */
@@ -52,6 +55,7 @@ LV_IMAGE_DECLARE(ico_weather);
 LV_IMAGE_DECLARE(ico_novel);
 LV_IMAGE_DECLARE(ico_pcmon);
 LV_IMAGE_DECLARE(ico_bluetooth);
+LV_IMAGE_DECLARE(ico_files);   /* 文件管理 */
 
 void lcd_test(void)
 {
@@ -196,6 +200,7 @@ static lv_obj_t *g_settings_screen = NULL;
 static lv_obj_t *g_clock_screen = NULL;
 static lv_obj_t *g_alarm_screen = NULL;
 static lv_obj_t *g_music_screen = NULL;
+static lv_obj_t *g_files_screen = NULL;   /* 文件管理 */
 /* 2048 小游戏 */
 static lv_obj_t *g_game_screen = NULL;
 static lv_obj_t *g_board_bg = NULL;          /* 棋盘底框（tile 的父容器） */
@@ -511,6 +516,12 @@ static void go_home_cb(lv_event_t *e)
     lv_screen_load(g_home);
 }
 
+/* 供 pvz.c 返回按钮调用: 跳回主界面。 */
+void ui_go_home(void) {
+    pc_mon_set_active(false);
+    lv_screen_load(g_home);
+}
+
 /* App 编号，用于懒加载各屏幕 */
 typedef enum {
     APP_WIFI = 1,
@@ -522,7 +533,8 @@ typedef enum {
     APP_NOVEL,
     APP_PCMON,
     APP_ALARM,
-    APP_BLE
+    APP_BLE,
+    APP_FILES
 } app_id_t;
 
 /* 打开某个 App 屏幕：仅记录待跳转 id，真正的建屏/加载放到主循环里执行。
@@ -535,9 +547,21 @@ static void open_screen_cb(lv_event_t *e)
 }
 
 /* 顶部状态栏（时间 + 电池），可复用 */
+/* 唯一实例句柄: 由 lvgl_ui_bootstrap 在 lv_layer_top() 上创建一次,
+ * 供游戏等需要全屏的界面临时隐藏/恢复 (ui_set_status_bar_visible)。 */
+static lv_obj_t *g_status_bar = NULL;
+
+void ui_set_status_bar_visible(bool vis)
+{
+    if (!g_status_bar) return;
+    if (vis) lv_obj_clear_flag(g_status_bar, LV_OBJ_FLAG_HIDDEN);
+    else     lv_obj_add_flag(g_status_bar, LV_OBJ_FLAG_HIDDEN);
+}
+
 static void make_status_bar(lv_obj_t *parent)
 {
     lv_obj_t *bar = lv_obj_create(parent);
+    g_status_bar = bar;
     lv_obj_set_size(bar, LCD_W, 22);
     lv_obj_align(bar, LV_ALIGN_TOP_LEFT, 0, 0);
     lv_obj_set_style_bg_color(bar, lv_color_hex(0x05050A), 0);
@@ -855,7 +879,7 @@ static void build_home(void)
     lv_obj_set_scrollbar_mode(g_home, LV_SCROLLBAR_MODE_AUTO);
     /* 状态栏由 lvgl_ui_bootstrap 在 lv_layer_top() 上统一创建，不随 g_home 滚动 */
 
-    struct { const lv_image_dsc_t *icon; const char *name; lv_color_t color; int id; } apps[9] = {
+    struct { const lv_image_dsc_t *icon; const char *name; lv_color_t color; int id; } apps[10] = {
         { &ico_wifi,     "无线", lv_color_hex(0x2E7DE0), APP_WIFI },
         { &ico_bluetooth, "蓝牙", lv_color_hex(0x0082FC), APP_BLE },
         { &ico_settings, "设置", lv_color_hex(0x6B7280), APP_SETTINGS },
@@ -865,10 +889,11 @@ static void build_home(void)
         { &ico_weather,  "天气", lv_color_hex(0xE08A2B), APP_WEATHER },
         { &ico_novel,    "小说", lv_color_hex(0xD4A24C), APP_NOVEL },
         { &ico_pcmon,    "监控", lv_color_hex(0x2EC4B6), APP_PCMON },
+        { &ico_files,    "文件", lv_color_hex(0xF2A33C), APP_FILES },
     };
-    /* 横屏 320×240：3 列 × 3 行排 7 个 App，第 3 行超出屏幕，靠竖直滚动翻到。
+    /* 横屏 320×240：3 列 × 4 行，第 3、4 行超出屏幕，靠竖直滚动翻到。
      *   列 x = 20 / 120 / 220（按钮宽 88 → 最右边缘 308 < 320）
-     *   行 y = 38 / 146 / 254（按钮高 88 → 第 3 行 254..342，需下滑） */
+     *   行 y = 38 / 146 / 254 / 362（按钮高 88，第 3 行起需下滑） */
     const int start_x = 20, start_y = 38;
     const int gap_x = 100, gap_y = 108;   // 3 列 × 3 行
     for (int i = 0; i < (int)(sizeof(apps) / sizeof(apps[0])); i++) {
@@ -1885,6 +1910,97 @@ static void game_gesture_cb(lv_event_t *e)
     game_move(dir);
 }
 
+/* ---------------- 游戏 App 选择菜单 ----------------
+ * 进入「游戏」App 时弹出一个 modal 让用户在 2048 / 贪吃蛇 之间二选一,
+ * 不修改主界面 9 个 App 布局。模态挂在 lv_layer_top() 上盖住当前屏。 */
+static lv_obj_t *g_game_mbox = NULL;
+static void build_game_screen(lv_obj_t *scr);  /* 前置声明 */
+
+static void game_mbox_close(void)
+{
+    if (!g_game_mbox) return;
+    lv_obj_del(g_game_mbox);
+    g_game_mbox = NULL;
+}
+
+static void game_mbox_2048_cb(lv_event_t *e)
+{
+    (void)e;
+    game_mbox_close();
+    if (!g_game_screen) { g_game_screen = make_app_screen("游戏2048"); build_game_screen(g_game_screen); }
+    lv_screen_load(g_game_screen);
+}
+
+static void game_mbox_snake_cb(lv_event_t *e)
+{
+    (void)e;
+    game_mbox_close();
+    snake_create_screen();   /* 内部已 lv_screen_load */
+}
+
+static void game_mbox_cancel_cb(lv_event_t *e)
+{
+    (void)e;
+    game_mbox_close();
+    extern void ui_go_home(void);
+    ui_go_home();
+}
+
+static void show_game_chooser(void)
+{
+    if (g_game_mbox) { lv_obj_del(g_game_mbox); g_game_mbox = NULL; }
+
+    lv_obj_t *m = lv_obj_create(lv_layer_top());
+    g_game_mbox = m;
+    lv_obj_set_size(m, 200, 210);
+    lv_obj_center(m);
+    lv_obj_set_style_bg_color(m, lv_color_hex(0x1A1A2E), 0);
+    lv_obj_set_style_bg_opa(m, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(m, lv_color_hex(0x4CAF50), 0);
+    lv_obj_set_style_border_width(m, 2, 0);
+    lv_obj_set_style_radius(m, 12, 0);
+    lv_obj_clear_flag(m, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(m);
+    lv_label_set_text(title, "选游戏");
+    lv_obj_set_style_text_font(title, &lv_font_cn_16, 0);
+    lv_obj_set_style_text_color(title, lv_color_white(), 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
+
+    /* 2048 按钮 */
+    lv_obj_t *b1 = lv_button_create(m);
+    lv_obj_set_size(b1, 160, 36);
+    lv_obj_align(b1, LV_ALIGN_TOP_MID, 0, 36);
+    lv_obj_set_style_bg_color(b1, lv_color_hex(0x607D8B), 0);
+    lv_obj_t *l1 = lv_label_create(b1);
+    lv_label_set_text(l1, "2048");
+    lv_obj_set_style_text_font(l1, &lv_font_cn_16, 0);
+    lv_obj_center(l1);
+    lv_obj_add_event_cb(b1, game_mbox_2048_cb, LV_EVENT_CLICKED, NULL);
+
+    /* 贪吃蛇 按钮 */
+    lv_obj_t *b2 = lv_button_create(m);
+    lv_obj_set_size(b2, 160, 36);
+    lv_obj_align(b2, LV_ALIGN_TOP_MID, 0, 80);
+    lv_obj_set_style_bg_color(b2, lv_color_hex(0x4CAF50), 0);
+    lv_obj_t *l2 = lv_label_create(b2);
+    lv_label_set_text(l2, "贪吃蛇");
+    lv_obj_set_style_text_font(l2, &lv_font_cn_16, 0);
+    lv_obj_center(l2);
+    lv_obj_add_event_cb(b2, game_mbox_snake_cb, LV_EVENT_CLICKED, NULL);
+
+    /* 取消按钮 */
+    lv_obj_t *b3 = lv_button_create(m);
+    lv_obj_set_size(b3, 160, 30);
+    lv_obj_align(b3, LV_ALIGN_TOP_MID, 0, 130);
+    lv_obj_set_style_bg_color(b3, lv_color_hex(0x424242), 0);
+    lv_obj_t *l3 = lv_label_create(b3);
+    lv_label_set_text(l3, "取消");
+    lv_obj_set_style_text_font(l3, &lv_font_cn_16, 0);
+    lv_obj_center(l3);
+    lv_obj_add_event_cb(b3, game_mbox_cancel_cb, LV_EVENT_CLICKED, NULL);
+}
+
 /* 构建 2048 游戏屏：标题栏右侧分数 + 4x4 棋盘底框（按实际尺寸预算格子大小居中） */
 static void build_game_screen(lv_obj_t *scr)
 {
@@ -2562,11 +2678,9 @@ static void ui_handle_pending_app(void)
         scr = g_music_screen;
         break;
     case APP_GAME:
-        if (!g_game_screen) {
-            g_game_screen = make_app_screen("2048");
-            build_game_screen(g_game_screen);
-        }
-        scr = g_game_screen;
+        /* 弹出选择菜单: 2048 / 贪吃蛇 二选一, 不直接切屏 */
+        show_game_chooser();
+        scr = NULL;
         break;
     case APP_WEATHER:
         if (!g_weather_screen) {
@@ -2614,6 +2728,13 @@ static void ui_handle_pending_app(void)
         }
         scr = g_ble_screen;
         break;
+    case APP_FILES:
+        if (!g_files_screen) {
+            g_files_screen = make_app_screen("文件管理");
+            build_file_manager_screen(g_files_screen);
+        }
+        scr = g_files_screen;
+        break;
     default:
         break;
     }
@@ -2623,6 +2744,9 @@ static void ui_handle_pending_app(void)
         }
         if (id == APP_BLE && g_ble_on) {
             ble_scan_trigger();
+        }
+        if (id == APP_FILES) {
+            file_mgr_on_open();   /* 请求挂载 SD 卡并列出根目录（真正干活在主循环） */
         }
         lv_screen_load(scr);
         /* 只有停留在监控界面时才让 pc_mon 联网拉数据，其余界面一律停止 */
@@ -2798,6 +2922,15 @@ static void ui_mem_dump_periodic(void)
     if (now - s_last_ms < 5000) return;
     s_last_ms = now;
     ui_mem_dump("5s");
+    /* 系统堆诊断：LVGL 那个池主要在 PSRAM，看不出内部 DRAM 的压力。
+     * 内部 RAM 不够时会表现为 SDMMC 报 NO_MEM、WiFi 四次握手超时断连，
+     * 所以这里把「内部 / DMA / 开机至今最低水位」一起打出来。 */
+    ESP_LOGW("HEAP", "[5s] 内部 free=%u 最低=%u | DMA free=%u 最低=%u | PSRAM free=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
+             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_DMA),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 }
 
 /* LVGL 主循环放在独立任务里运行，给足栈空间避免栈溢出 */
@@ -2820,6 +2953,8 @@ static void lvgl_task(void *arg)
         ui_status_clocks_refresh();   /* 状态栏时钟（恢复） */
         ui_weather_screen_refresh();
         ui_pcmon_screen_refresh();
+        file_mgr_periodic();          /* 文件管理：挂载 / 列目录 / 预览 / 删除 */
+        media_periodic();             /* 图片/视频：MJPEG 逐帧解码 + 刷屏 */
 
         /* 延迟任务：密码面板、App 跳转、触摸红点、WiFi 列表刷新 */
         ui_handle_pending_password();
@@ -2832,6 +2967,9 @@ static void lvgl_task(void *arg)
 
         /* 诊断：每 5 秒打印一次 LV_MEM 占用 */
         ui_mem_dump_periodic();
+
+        /* 贪吃蛇每帧更新: 蛇移动 + 碰撞检测 */
+        snake_update();
 
         /* 处理 LVGL 任务，返回建议休眠 ms */
         uint32_t t0 = lv_tick_get();

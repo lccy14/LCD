@@ -6,11 +6,33 @@
 #include "esp_lcd_io_i80.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 static const char *TAG = "LCD_INIT";
 
 /* 内部句柄 */
 static esp_lcd_panel_io_handle_t s_lcd_io = NULL;
+
+/* 每个 I80 颜色事务 DMA 完成时 give 一次。视频播放直写 g_framebuffer 后
+ * 必须等它，否则下一帧解码会和 DMA 抢同一块缓冲（队列深度 6 可攒多个事务）。
+ * LVGL 路径不用它（走自己的 flush_ready 回调），多 give 无副作用。 */
+static SemaphoreHandle_t s_trans_done_sem = NULL;
+
+/* 返回 true=等到了一次 DMA 完成；false=超时无完成（队列已空） */
+bool LCD_WaitFlushDone(uint32_t timeout_ms)
+{
+    if (!s_trans_done_sem) return false;
+    return xSemaphoreTake(s_trans_done_sem, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
+}
+
+/* 取走所有已完成的通知（开始视频播放前清空历史事务计数用） */
+void LCD_DrainFlushDone(void)
+{
+    if (s_trans_done_sem) {
+        while (xSemaphoreTake(s_trans_done_sem, 0) == pdTRUE) { }
+    }
+}
 
 /* 全局句柄，供 lcd.c / lvgl_port.c 使用 esp_lcd_panel_draw_bitmap */
 esp_lcd_panel_handle_t g_lcd_panel = NULL;
@@ -27,10 +49,18 @@ void lcd_set_color_trans_done_cb(bool (*cb)(esp_lcd_panel_io_handle_t, esp_lcd_p
     s_color_trans_done_ctx = ctx;
 }
 
-/* I80 驱动的 on_color_trans_done 入口：转给上层（LVGL） */
+/* I80 驱动的 on_color_trans_done 入口：通知等待者（视频）并转给上层（LVGL） */
 static bool lcd_on_color_trans_done(esp_lcd_panel_io_handle_t io, esp_lcd_panel_io_event_data_t *edata, void *user_ctx)
 {
     (void)io; (void)edata; (void)user_ctx;
+    if (s_trans_done_sem) {
+        BaseType_t higher_priority_task_woken = pdFALSE;
+        /* 计数满（等待者不积极）时忽略即可 */
+        (void)xSemaphoreGiveFromISR(s_trans_done_sem, &higher_priority_task_woken);
+        if (higher_priority_task_woken == pdTRUE) {
+            portYIELD_FROM_ISR();
+        }
+    }
     if (s_color_trans_done_cb) {
         return s_color_trans_done_cb(io, edata, s_color_trans_done_ctx);
     }
@@ -42,6 +72,11 @@ static bool lcd_on_color_trans_done(esp_lcd_panel_io_handle_t io, esp_lcd_panel_
 ******************************************************************************/
 void LCD_GPIO_Init(void)
 {
+    /* DMA 完成计数信号量：最大计数 >= I80 事务队列深度(6)+1 */
+    if (!s_trans_done_sem) {
+        s_trans_done_sem = xSemaphoreCreateCounting(8, 0);
+    }
+
     /* 1. RST / BLK 作为普通 GPIO 输出 */
     gpio_config_t io_conf = {};
     io_conf.intr_type    = GPIO_INTR_DISABLE;

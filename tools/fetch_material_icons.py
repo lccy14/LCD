@@ -21,7 +21,7 @@ REPO = "google/material-design-icons"
 REF = "3.0.1"          # 该版本目录里仍保留各种密度的 PNG 原图
 OUT_DIR = sys.argv[1] if len(sys.argv) > 1 else os.path.join("assets", "icons")
 
-# 界面需要的 8 个图标: (本地文件名, Material 图标名)
+# 界面需要的图标: (本地文件名, Material 图标名)
 WANTED = [
     ("wifi",     "signal_wifi_4_bar"),
     ("settings", "settings"),
@@ -31,6 +31,7 @@ WANTED = [
     ("weather",  "wb_sunny"),
     ("novel",    "book"),
     ("pcmon",    "desktop_windows"),
+    ("files",    "folder"),      # 文件管理 App
 ]
 
 

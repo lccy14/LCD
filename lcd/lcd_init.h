@@ -61,4 +61,9 @@ void LCD_Init(void);                     // LCD 初始化
  * 必须在 LCD_Init() 之前调用。*/
 void lcd_set_color_trans_done_cb(bool (*cb)(esp_lcd_panel_io_handle_t, esp_lcd_panel_io_event_data_t *, void *), void *ctx);
 
+/* 等待一次 I80 颜色 DMA 完成（true=等到；false=超时无完成=队列已空）/ 清空已完成计数。
+ * 视频直写 framebuffer 后必须等，防下一帧解码与 DMA 抢缓冲导致花屏。 */
+bool LCD_WaitFlushDone(uint32_t timeout_ms);
+void LCD_DrainFlushDone(void);
+
 #endif

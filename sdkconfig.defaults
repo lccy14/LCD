@@ -3,3 +3,47 @@ CONFIG_BT_BLE_ENABLED=y
 CONFIG_BT_NIMBLE_ENABLED=y
 CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=n
 CONFIG_BT_NIMBLE_ROLE_BROADCASTER=n
+
+# ---------------------------------------------------------------------------
+# 内部 DRAM 很紧张（LVGL draw buf + WiFi + BT 都要内部 RAM，SDMMC 还要 DMA 内存），
+# 下面几项都是为了把内部 DRAM 省出来：
+# ---------------------------------------------------------------------------
+# 1) NimBLE 主机栈的动态内存改从 PSRAM 分配（默认 INTERNAL），省出几十 KB 内部 DRAM
+CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y
+
+# 2) LVGL 内置内存池只要 16KB（这块是 .bss，占内部 RAM）；
+#    LV_MEM_POOL_EXPAND_SIZE 只抬高「单池上限 / 最大可分配块」不占内存，
+#    看图时解码出来的整帧（320x240 RGB888 约 230KB）需要 >128KB 的块，
+#    所以这里给到 256KB
+CONFIG_LV_MEM_SIZE_KILOBYTES=16
+# 只抬高 TLSF「单池上限」= 1<<log2ceil(LV_MEM_SIZE+EXPAND) = 1MB，本身不占内存。
+# 必须够大，否则 lv_mem_add_pool() 挂不上 512KB 的大池，
+# 看图时 PNG 解码要的 320x240x4=307KB 连续块就拿不到（画面全黑）。
+CONFIG_LV_MEM_POOL_EXPAND_SIZE_KILOBYTES=512
+
+# 图片缓存：关着(0)的话每次重绘都要重新解码一遍 SD 卡上的 PNG（几百毫秒）。
+# 开着就必须 >= 单张解码结果（320x240 ARGB8888 = 307KB），否则解码器直接返回失败。
+CONFIG_LV_CACHE_DEF_SIZE=524288
+
+# 4) 图片/视频解码：BMP、PNG、JPEG(TJPGD) + LVGL 的 POSIX 文件系统
+#    （'S' 盘 = /sdcard，于是 lv_image_set_src(img, "S:/a.jpg") 直接读 SD 卡）
+CONFIG_LV_USE_BMP=y
+CONFIG_LV_USE_LODEPNG=y
+CONFIG_LV_USE_TJPGD=y
+CONFIG_LV_USE_FS_POSIX=y
+CONFIG_LV_FS_POSIX_LETTER=83
+CONFIG_LV_FS_POSIX_PATH="/sdcard"
+
+# 3) 预留更多内部 RAM 给 DMA / 内部专用分配（SDMMC、WiFi buffer），
+#    避免能被 PSRAM 接盘的分配把内部 RAM 吃光
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=65536
+
+# ---------------------------------------------------------------------------
+# SD 卡中文文件名：FATFS 必须按 UTF-8 给 API，LVGL 才能正常显示中文
+# ---------------------------------------------------------------------------
+# 默认 ANSI/OEM(CP437) 下，中文长文件名无法转换，会变成 '?' 或直接退回
+# 8.3 短名（比如 240X32~1.AVI）。UTF-8 + CP936 才能原样拿到中文。
+# 注意：改这项只影响文件名编码，代码里的路径是 ASCII，不受影响。
+CONFIG_FATFS_API_ENCODING_UTF_8=y
+CONFIG_FATFS_CODEPAGE=936
+CONFIG_FATFS_CODEPAGE_936=y

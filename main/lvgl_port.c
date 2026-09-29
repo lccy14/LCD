@@ -8,6 +8,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+/* lv_draw_buf_handlers_t 的字段定义在私有头里（要改图片解码缓冲的分配回调） */
+#include "src/draw/lv_draw_buf_private.h"
 
 static const char *TAG = "LVGL_PORT";
 
@@ -16,18 +18,38 @@ static const char *TAG = "LVGL_PORT";
 extern TaskHandle_t g_lvgl_task;
 
 /* 额外给 LVGL 挂的 PSRAM 内存池总大小（KB）。
- * 内置的 LV_MEM（sdkconfig: CONFIG_LV_MEM_SIZE_KILOBYTES，当前 64KB）装不下所有
+ * 内置的 LV_MEM（sdkconfig: CONFIG_LV_MEM_SIZE_KILOBYTES，当前 16KB）装不下所有
  * App 屏幕的常驻对象——实测开 3~4 个 App 就用到 99%，maxfree 只剩 608 字节，
  * 之后 lv_malloc 失败会触发断言死循环，进而 task_wdt 复位。
  *
- * 注意：LVGL 的 TLSF 对「单个」池有大小上限（见 lv_tlsf.c）：
+ * ★ 关键：TLSF 不能跨池合并，所以「LVGL 单次最大可分配块」= 单个池的大小。
+ *   全用 64KB 小池堆到 512KB，maxfree 就永远只有 64KB —— 看图时 PNG 解码要
+ *   320*240*4 = 307KB 连续块，必然失败，屏幕上就是一片黑（已实测踩坑）。
+ *   所以第一块必须挂一整块大的，剩下的再用小块补足总量。
+ *
+ * 单池上限（见 lv_tlsf.c）：
  *     #define TLSF_MAX_POOL_SIZE (LV_MEM_SIZE + LV_MEM_POOL_EXPAND_SIZE)
  *     block_size_max = 1 << log2_ceil(TLSF_MAX_POOL_SIZE)
- * 当前 LV_MEM_SIZE=64KB 且 LV_MEM_POOL_EXPAND_SIZE=0，单池上限就是 64KB，
- * 一次性挂 128KB / 256KB 会被 lv_mem_add_pool() 拒绝（已实测确认）。
- * 因此按 LV_POOL_CHUNK_KB 一块分批挂载，累计到 LV_POOL_TOTAL_KB。 */
-#define LV_POOL_TOTAL_KB   256
-#define LV_POOL_CHUNK_KB   64
+ * 现在 LV_MEM_SIZE=16KB、LV_MEM_POOL_EXPAND_SIZE=512KB → 上限 1MB，
+ * 挂 512KB 单池没问题（EXPAND 只抬高上限，本身不占内存）。 */
+/* 池子总量 = k_pool_chunks[] 之和 = 1024KB（PSRAM 空闲约 1.0MB，够用）
+ *
+ * 看图解码一次 PNG，LVGL 池里同时活着四块（都是 lodepng 的 lv_malloc）：
+ *   文件缓冲    = 整个文件大小（lodepng_load_file 整读）        320x240 那张 = 162KB
+ *   idat        = 压缩数据（≈ 文件大小）                                    ≈ 162KB
+ *   解压扫描线  = w*h*4 + h                                                   307KB
+ *   zlib window = 32KB
+ * 合计 ≈ 663KB，再加上 App 常驻对象，池子得给到 1MB 左右才转得开。
+ * 注意：解出来的那一帧（w*h*4）已经改走系统 PSRAM，不占这里的池。
+ *
+ * 384KB 那个池是给「文件/idat」这种中等块用的：TLSF 是最佳适配，
+ * 有它接着，512KB 的大池就不会被切碎，扫描线那 307KB 才有地方落脚。 */
+static const size_t k_pool_chunks[] = {
+    512 * 1024,     /* 看图：扫描线（w*h*4）要连续空间，320x240 就是 307KB */
+    384 * 1024,     /* 解码时同时活着的文件缓冲 + idat */
+    64 * 1024,
+    64 * 1024,
+};
 
 /* PARTIAL 渲染模式: 两个内部 RAM draw buf, 每个 320×40×2=25KB。
  * 内部 SRAM 访问速度比 PSRAM 快 5-10 倍, LVGL 渲染加速;
@@ -94,34 +116,68 @@ static void disp_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px
 
 /* 给 LVGL 追加内存池（lv_mem_add_pool() 会把每块加进 LVGL 的 TLSF 分配器）。
  * cap 是 heap_caps 能力：MALLOC_CAP_SPIRAM（外部 PSRAM）或 MALLOC_CAP_INTERNAL。
- * TLSF 单池有 64KB 上限，所以按 LV_POOL_CHUNK_KB 分块循环挂载，
- * 直到累计到 LV_POOL_TOTAL_KB；返回实际挂上的总字节数（可能小于目标）。
+ * 按 k_pool_chunks[] 依次挂载（先大块后小块），返回实际挂上的总字节数。
  * 注意：LVGL 内部日志(LV_USE_LOG)默认关闭，add_pool 失败时其 printf 也看不到，
  * 所以这里每一步都用 ESP_LOG 打点，便于确认卡在哪一步。 */
 static size_t lvgl_add_mem_pool(uint32_t cap, const char *cap_name)
 {
-    const size_t target = (size_t)LV_POOL_TOTAL_KB * 1024;
-    const size_t chunk  = (size_t)LV_POOL_CHUNK_KB * 1024;
+    const size_t n = sizeof(k_pool_chunks) / sizeof(k_pool_chunks[0]);
     size_t added = 0;
 
-    while (added < target) {
+    for (size_t i = 0; i < n; i++) {
+        size_t chunk = k_pool_chunks[i];
         void *p = heap_caps_malloc(chunk, cap);
         if (p == NULL) {
-            ESP_LOGW(TAG, "%s: malloc %uKB chunk failed (added %uKB so far)",
-                     cap_name, (unsigned)LV_POOL_CHUNK_KB, (unsigned)(added / 1024));
-            break;
+            ESP_LOGW(TAG, "%s: malloc %uKB failed (已挂 %uKB)，继续试小块",
+                     cap_name, (unsigned)(chunk / 1024), (unsigned)(added / 1024));
+            continue;                            /* 大块挂不上就退到小块 */
         }
         if (lv_mem_add_pool(p, chunk) == NULL) {
-            ESP_LOGE(TAG, "%s: lv_mem_add_pool(%uKB @ %p) failed",
-                     cap_name, (unsigned)LV_POOL_CHUNK_KB, p);
+            ESP_LOGE(TAG, "%s: lv_mem_add_pool(%uKB @ %p) 失败（单池上限？）",
+                     cap_name, (unsigned)(chunk / 1024), p);
             heap_caps_free(p);
-            break;
+            continue;
         }
         added += chunk;
         ESP_LOGI(TAG, "%s: +%uKB pool @ %p (total %uKB)",
-                 cap_name, (unsigned)LV_POOL_CHUNK_KB, p, (unsigned)(added / 1024));
+                 cap_name, (unsigned)(chunk / 1024), p, (unsigned)(added / 1024));
     }
+    ESP_LOGI(TAG, "%s: 共挂 %uKB，单次最大可分配 <= %uKB（TLSF 不能跨池合并）",
+             cap_name, (unsigned)(added / 1024), (unsigned)(k_pool_chunks[0] / 1024));
     return added;
+}
+
+/* 图片解码出来的那一帧改走系统 PSRAM 堆，不再占 LVGL 内存池。
+ *
+ * 原因：LVGL 解 PNG 时三块内存是同时活着的（都在 lv_malloc = LVGL 池里）：
+ *   ① 文件缓冲   = 整个文件大小（lodepng_load_file 整读）
+ *   ② 解压扫描线 = w*h*4 + h（idat 解压结果）
+ *   ③ 解出的帧   = w*h*4（lv_draw_buf_create_ex）
+ * ② 要等 postProcessScanlines 用完才释放，③ 在那之前就分配好了，
+ * 所以 320x240 的 PNG 峰值 ≈ 文件 + 2*w*h*4 ≈ 777KB，比池总量还大，
+ * 必然 err=83（memory allocation failed）。
+ * ③ 走的是这里的 draw_buf 分配回调，把它挪到系统 PSRAM 后，
+ * 池里只剩 ①+② ≈ 470KB，512KB 的池就装得下了。 */
+static void * img_buf_malloc(size_t size, lv_color_format_t color_format)
+{
+    LV_UNUSED(color_format);
+    void * p = heap_caps_malloc(size, MALLOC_CAP_SPIRAM);
+    if (p == NULL) {
+        /* 万一 PSRAM 也不够，退回 LVGL 池，别比原来更糟 */
+        ESP_LOGW(TAG, "图片缓冲 %u 字节 PSRAM 分配失败（空闲 %u，最大块 %u），退回 LVGL 池",
+                 (unsigned)size,
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+        return lv_malloc(size);
+    }
+    ESP_LOGI(TAG, "图片缓冲 %u 字节 → PSRAM @ %p", (unsigned)size, p);
+    return p;
+}
+
+static void img_buf_free(void * buf)
+{
+    /* heap_caps_free 能按指针找到所属堆，退回池里分配的那块也能正常释放 */
+    heap_caps_free(buf);
 }
 
 /* esp_timer 周期回调：每 1ms 给 LVGL 喂一次 tick */
@@ -136,6 +192,12 @@ void lvgl_port_init(void)
     LCD_Init();          // 必须先初始化 SPI 与 LCD，否则后续 flush 的 spi_handle 无效
     lv_init();
 
+    /* SD 卡文件接入 LVGL：'S' 盘（= /sdcard，见 sdkconfig 的 LV_USE_FS_POSIX /
+     * LV_FS_POSIX_LETTER / LV_FS_POSIX_PATH）。之后 lv_image_set_src(img, "S:/dir/a.jpg")
+     * 就能直接解码显示 SD 卡里的图。
+     * 注意：lv_init() 内部已经调用过 lv_fs_posix_init()（见 lv_init.c），
+     * 这里不能再注册一次，否则同一个盘符会被注册两遍。 */
+
     /* 给 LVGL 追加内存池：优先 PSRAM，失败则退回内部 DRAM，并逐级降容量重试。
      * 必须在 lv_init() 之后调用。 */
     size_t added = lvgl_add_mem_pool(MALLOC_CAP_SPIRAM, "PSRAM");
@@ -149,6 +211,14 @@ void lvgl_port_init(void)
     lv_mem_monitor(&mon);
     ESP_LOGI(TAG, "LVGL total memory = %u bytes (extra pool added = %u)",
              (unsigned)mon.total_size, (unsigned)added);
+
+    /* 图片解码结果（整帧 ARGB8888）改用系统 PSRAM，别挤 LVGL 池 */
+    lv_draw_buf_handlers_t * img_hd = lv_draw_buf_get_image_handlers();
+    if (img_hd) {
+        img_hd->buf_malloc_cb = img_buf_malloc;
+        img_hd->buf_free_cb   = img_buf_free;
+        ESP_LOGI(TAG, "图片解码帧改走系统 PSRAM（LVGL 池只留文件+扫描线）");
+    }
 
     /* 分配两个内部 RAM draw buf (PARTIAL 模式)。
      * 优先 MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA, 满足 GDMA 对源缓冲的可访问性要求。 */
