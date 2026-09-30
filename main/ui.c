@@ -2996,7 +2996,7 @@ static void lvgl_task(void *arg)
 /* 启动 LVGL 任务：main 任务默认栈太小（LVGL 渲染需要较大栈），另起大栈任务 */
 static void lvgl_run(void)
 {
-    xTaskCreate(lvgl_task, "lvgl", 8192, NULL, 5, &g_lvgl_task);
+    xTaskCreate(lvgl_task, "lvgl", 16384, NULL, 5, &g_lvgl_task);
 }
 
 #endif /* USE_LVGL */

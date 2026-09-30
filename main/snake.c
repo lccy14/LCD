@@ -5,14 +5,17 @@
 #include "esp_log.h"
 #include <string.h>
 #include <stdlib.h>
+#include <stdint.h>          /* uintptr_t: 方向枚举塞进事件的 user_data */
 
 /* ===================== 贪吃蛇 =====================
- * 网格 20×13 (每格 16px), 留 32px 给顶部 UI
+ * 左侧游戏区 240×208 (网格 15×13, 每格 16px), 右侧 80px 放方向键
+ * 顶部 32px 给 Back + 分数
  * Sprite 素材: Snake.png (CC0, eugeneloza github.com/eugeneloza/SnakeGame)
  *   - 蛇头 4 方向: idx 0=UP 1=RIGHT 2=DOWN 3=LEFT
  *   - 蛇身水平: idx 4
  *   - 食物: idx 14
- * 滑动控制方向, 吃食物 +10 分, 撞墙/撞自己 = 死亡
+ * 方向键控制: 按下即刻转向并马上走一步(不等下一个定时 tick), 比滑动灵敏
+ * 吃食物 +10 分, 撞墙/撞自己 = 死亡
  */
 
 #define TAG "SNAKE"
@@ -21,9 +24,18 @@
 #define SNK_CELL_H        16
 #define SNK_GRID_X0       0
 #define SNK_GRID_Y0       32       /* 顶部 UI 32px */
-#define SNK_COLS          20        /* 320/16 */
+#define SNK_COLS          15        /* 240/16: 右边留 80px 给方向键 */
 #define SNK_ROWS          13        /* (240-32)/16 = 13 */
 #define SNK_MAX_LEN       (SNK_COLS * SNK_ROWS)
+
+/* 右侧方向键区: 紧凑十字布局（上下键宽、左右键窄，x: 240~319） */
+#define SNK_PAD_X0        (SNK_COLS * SNK_CELL_W)   /* 240 = 游戏区右边界 */
+#define SNK_BTN_H         48
+#define SNK_BTN_GAP       4
+#define SNK_BTN_W         72        /* 上下键宽 */
+#define SNK_BTN_SW        34        /* 左右键宽 */
+#define SNK_PAD_X         (SNK_PAD_X0 + 4)                    /* 244 */
+#define SNK_PAD_TOP       (SNK_GRID_Y0 + 28)                  /* 60: 竖直居中 */
 
 #define SPRITE_W          SNAKE_SPRITE_PX   /* 16 */
 #define SPRITE_H          SNAKE_SPRITE_PX
@@ -67,17 +79,14 @@ static snake_pt_t g_snake[SNK_MAX_LEN];
 static snake_pt_t g_food;
 static snake_dir_t g_dir = DIR_RIGHT;
 static snake_dir_t g_pending_dir = DIR_RIGHT;
-static int g_step_timer = 0;
 static int g_score = 0;
 static bool g_active = false;
 static bool g_game_over = false;
-static uint32_t g_last_ms = 0;
+static uint32_t g_last_step_ms = 0;   /* 上一次真正走一步的时刻 */
 
-/* 滑动检测: 记录按下点, 抬起时根据偏移判断方向 */
-static lv_point_t g_touch_start = {0, 0};
-static bool g_touch_down = false;
-
-#define STEP_INTERVAL_MS  300    /* 每 300ms 走一步 */
+#define STEP_INTERVAL_MS  300    /* 没按键时, 每 300ms 自动走一步 */
+#define BTN_MIN_STEP_MS   110    /* 连点保护: 两次「按键立即走一步」的最小间隔。
+                                  * 防手抖/连点让蛇瞬间窜出去; 仍远快于自动步进 */
 
 /* 工具 */
 static int cell_x(int col) { return SNK_GRID_X0 + col * SNK_CELL_W; }
@@ -142,7 +151,8 @@ static void show_game_over(void) {
     g_game_over = true;
     lv_obj_t *bg = lv_obj_create(g_snake_screen);
     lv_obj_set_size(bg, 200, 100);
-    lv_obj_center(bg);
+    /* 居中于左侧游戏区 (240×208, y 从 32 起), 而不是整个屏幕, 免得压住方向键 */
+    lv_obj_align(bg, LV_ALIGN_TOP_LEFT, 20, SNK_GRID_Y0 + 54);
     lv_obj_set_style_bg_color(bg, lv_color_hex(0x000000), 0);
     lv_obj_set_style_bg_opa(bg, LV_OPA_90, 0);
     lv_obj_set_style_radius(bg, 10, 0);
@@ -153,31 +163,84 @@ static void show_game_over(void) {
     lv_obj_center(lbl);
 }
 
-/* 方向控制: 滑动检测 */
-static void snake_screen_event_cb(lv_event_t *e) {
-    lv_event_code_t code = lv_event_get_code(e);
-    lv_indev_t *indev = lv_indev_get_act();
-    lv_point_t p;
-    lv_indev_get_point(indev, &p);
+/* ---------------- 方向键控制 ----------------
+ * 原来的滑动方案有两个毛病: ① 要抬起手指才判定方向, 有延迟;
+ * ② 改完方向还得等下一个 300ms tick 才动, 按下去像"没反应"。
+ * 现在改成: 手指一按下就转向, 并且立刻走一步。 */
 
-    if (code == LV_EVENT_PRESSED) {
-        g_touch_start = p;
-        g_touch_down = true;
-    } else if (code == LV_EVENT_RELEASED && g_touch_down) {
-        g_touch_down = false;
-        int dx = p.x - g_touch_start.x;
-        int dy = p.y - g_touch_start.y;
-        if (dx*dx + dy*dy < 100) return;  /* 太短忽略 */
-        if (abs(dx) > abs(dy)) {
-            /* 水平 */
-            if (dx > 0 && g_dir != DIR_LEFT)  g_pending_dir = DIR_RIGHT;
-            else if (dx < 0 && g_dir != DIR_RIGHT) g_pending_dir = DIR_LEFT;
-        } else {
-            /* 垂直 */
-            if (dy > 0 && g_dir != DIR_UP)    g_pending_dir = DIR_DOWN;
-            else if (dy < 0 && g_dir != DIR_DOWN) g_pending_dir = DIR_UP;
-        }
+static void snake_step(void);   /* 定义在下面, 这里先声明给 try_step 用 */
+
+/* 走一步的统一入口: 按键和定时 tick 共用同一个时间戳,
+ * 避免「按键刚走一步、定时器紧接着又走一步」忽快忽慢。
+ * min_gap = 距上一步至少要间隔多少毫秒, 不满足就只记方向不动 */
+static void try_step(uint32_t min_gap)
+{
+    if (!g_active || g_game_over) return;
+    uint32_t now = lv_tick_get();
+    if (now - g_last_step_ms < min_gap) return;
+    g_last_step_ms = now;
+    snake_step();
+}
+
+/* 方向键回调。用 PRESSED 而不是 CLICKED —— 手指一碰就响应, 不必等抬起。
+ * user_data 里直接塞方向枚举本身(值 0~3, 不是指针) */
+static void dpad_cb(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_PRESSED) return;
+    if (!g_active || g_game_over) return;
+
+    snake_dir_t d = (snake_dir_t)(uintptr_t)lv_event_get_user_data(e);
+
+    /* 禁止 180° 掉头: 脖子就在身后那格, 转过去必死 */
+    if ((d == DIR_UP    && g_dir == DIR_DOWN)  ||
+        (d == DIR_DOWN  && g_dir == DIR_UP)    ||
+        (d == DIR_LEFT  && g_dir == DIR_RIGHT) ||
+        (d == DIR_RIGHT && g_dir == DIR_LEFT)) {
+        return;
     }
+
+    /* 方向立即生效, 而不是塞进 g_pending_dir 等下一个 tick:
+     * 连按时掉头判断要用蛇的真实朝向, 也才有"跟手"的感觉 */
+    g_dir = d;
+    g_pending_dir = d;
+    try_step(BTN_MIN_STEP_MS);
+}
+
+/* 画一个方向键 */
+static void dpad_key(int x, int y, int w, int h, const char *sym, snake_dir_t d)
+{
+    lv_obj_t *b = lv_button_create(g_snake_screen);
+    lv_obj_set_size(b, w, h);
+    lv_obj_set_pos(b, x, y);
+    lv_obj_set_style_bg_color(b, lv_color_hex(0x2A2A44), 0);
+    lv_obj_set_style_bg_color(b, lv_color_hex(0x4CAF50), LV_STATE_PRESSED);  /* 按下高亮 */
+    lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(b, 8, 0);
+    lv_obj_set_style_border_width(b, 0, 0);
+    lv_obj_set_style_pad_all(b, 0, 0);
+    lv_obj_set_style_shadow_opa(b, LV_OPA_TRANSP, 0);
+    lv_obj_clear_flag(b, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *l = lv_label_create(b);
+    lv_label_set_text(l, sym);
+    lv_obj_set_style_text_font(l, &lv_font_montserrat_24, 0);   /* 箭头放大, 按着有准头 */
+    lv_obj_set_style_text_color(l, lv_color_hex(0xE8DEF8), 0);
+    lv_obj_center(l);
+
+    lv_obj_add_event_cb(b, dpad_cb, LV_EVENT_PRESSED, (void *)(uintptr_t)d);
+}
+
+/* 右侧方向键, 十字排布: 上下两个长条 + 中间一对左右键 */
+static void build_dpad(void)
+{
+    const int y_lr   = SNK_PAD_TOP + (SNK_BTN_H + SNK_BTN_GAP);
+    const int y_down = SNK_PAD_TOP + (SNK_BTN_H + SNK_BTN_GAP) * 2;
+    const int x_r    = SNK_PAD_X + SNK_BTN_SW + SNK_BTN_GAP;
+
+    dpad_key(SNK_PAD_X, SNK_PAD_TOP, SNK_BTN_W,  SNK_BTN_H, LV_SYMBOL_UP,    DIR_UP);
+    dpad_key(SNK_PAD_X, y_lr,        SNK_BTN_SW, SNK_BTN_H, LV_SYMBOL_LEFT,  DIR_LEFT);
+    dpad_key(x_r,       y_lr,        SNK_BTN_SW, SNK_BTN_H, LV_SYMBOL_RIGHT, DIR_RIGHT);
+    dpad_key(SNK_PAD_X, y_down,      SNK_BTN_W,  SNK_BTN_H, LV_SYMBOL_DOWN,  DIR_DOWN);
 }
 
 static void snake_back_cb(lv_event_t *e) {
@@ -211,16 +274,15 @@ static void snake_init(void) {
     g_dir = DIR_RIGHT;
     g_pending_dir = DIR_RIGHT;
     g_score = 0;
-    g_step_timer = 0;
     g_game_over = false;
-    g_last_ms = 0;
+    g_last_step_ms = lv_tick_get();   /* 从现在开始计时, 第一步走 STEP_INTERVAL_MS 后 */
 
     spawn_food();
     draw_food();
     draw_snake();
 
     if (g_score_label) lv_label_set_text_fmt(g_score_label, "Score: 0");
-    if (g_tip_label) lv_label_set_text(g_tip_label, "Swipe to move");
+    if (g_tip_label) lv_label_set_text(g_tip_label, "Tap arrows");
 }
 
 /* 走一步 */
@@ -267,11 +329,10 @@ static void snake_step(void) {
 
 void snake_update(void) {
     if (!g_active || g_game_over) return;
+    /* 没按方向键时保持匀速自动行走 */
     uint32_t now = lv_tick_get();
-    if (g_last_ms == 0) g_last_ms = now;
-    int dt = (int)(now - g_last_ms);
-    if (dt < STEP_INTERVAL_MS) return;
-    g_last_ms = now;
+    if (now - g_last_step_ms < STEP_INTERVAL_MS) return;
+    g_last_step_ms = now;
     snake_step();
 }
 
@@ -326,14 +387,10 @@ void snake_create_screen(void) {
 
     g_tip_label = lv_label_create(g_snake_screen);
     lv_obj_set_pos(g_tip_label, 200, 10);
-    lv_label_set_text(g_tip_label, "Swipe to move");
+    lv_label_set_text(g_tip_label, "Tap arrows");
     lv_obj_set_style_text_color(g_tip_label, lv_color_hex(0xCCCCCC), 0);
 
-    /* 整屏事件: 滑动检测 */
-    lv_obj_add_event_cb(g_snake_screen, snake_screen_event_cb,
-                        LV_EVENT_PRESSED, NULL);
-    lv_obj_add_event_cb(g_snake_screen, snake_screen_event_cb,
-                        LV_EVENT_RELEASED, NULL);
+    build_dpad();
 
     snake_init();
     lv_screen_load(g_snake_screen);

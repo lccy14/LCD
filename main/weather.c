@@ -353,7 +353,7 @@ static void weather_task(void *arg)
 void weather_init(void)
 {
     s_req_sem = xSemaphoreCreateBinary();
-    xTaskCreate(weather_task, "weather", 16384, NULL, 3, NULL);
+    xTaskCreate(weather_task, "weather", 32768, NULL, 3, NULL);
 }
 
 void weather_request(const char *city)
