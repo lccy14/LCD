@@ -24,7 +24,10 @@
 #include "snake.h"            /* 贪吃蛇 */
 #include "novel_text.h"
 #include "file_mgr.h"         /* 文件管理（SD 卡 / SDMMC + FATFS） */
-#include "media.h"            /* 图片查看 / MJPEG 视频播放 */
+#include "media.h"            /* 图片查看（JPG/PNG/BMP） */
+#include <dirent.h>           /* 音乐：扫描 SD 卡音频文件（opendir/readdir） */
+#include <strings.h>          /* strcasecmp，音乐扩展名判断 */
+#include <sys/stat.h>         /* stat，估算音频时长 */
 
 /* LVGL 主任务句柄, 供 lvgl_port.c 的 DMA 完成中断回调 xTaskNotifyGive 唤醒主循环。
  * 替代 vTaskDelay 固定 10ms 等待: DMA 完成立刻唤醒, 滑动 FPS 46→80+。 */
@@ -708,6 +711,10 @@ static lv_obj_t *make_app_screen(const char *title)
     lv_obj_set_style_bg_color(bar, lv_color_hex(0x16161F), 0);
     lv_obj_set_style_radius(bar, 0, 0);
     lv_obj_set_style_border_opa(bar, LV_OPA_TRANSP, 0);
+    /* 返回栏是纯展示条，关掉滚动（否则 lv_obj_create 默认带 SCROLLABLE，
+     * 整条栏会被手指拖动上下滑，既无作用又空耗 LVGL 滚动引擎） */
+    lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(bar, LV_SCROLLBAR_MODE_OFF);
     lv_obj_set_flex_flow(bar, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(bar, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_hor(bar, 8, 0);
@@ -1025,6 +1032,9 @@ static void build_wifi_screen(lv_obj_t *scr)
     lv_obj_set_style_bg_opa(header, LV_OPA_COVER, 0);
     lv_obj_set_style_radius(header, 0, 0);
     lv_obj_set_style_border_opa(header, LV_OPA_TRANSP, 0);
+    /* 返回栏纯展示，关掉滚动（否则会被手指拖动上下滑，空耗 LVGL 滚动引擎） */
+    lv_obj_clear_flag(header, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(header, LV_SCROLLBAR_MODE_OFF);
     lv_obj_set_flex_flow(header, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(header, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_hor(header, 10, 0);
@@ -1291,6 +1301,9 @@ static void build_ble_screen(lv_obj_t *scr)
     lv_obj_set_style_bg_opa(header, LV_OPA_COVER, 0);
     lv_obj_set_style_radius(header, 0, 0);
     lv_obj_set_style_border_opa(header, LV_OPA_TRANSP, 0);
+    /* 返回栏纯展示，关掉滚动（否则会被手指拖动上下滑，空耗 LVGL 滚动引擎） */
+    lv_obj_clear_flag(header, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(header, LV_SCROLLBAR_MODE_OFF);
     lv_obj_set_flex_flow(header, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(header, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_hor(header, 10, 0);
@@ -1743,6 +1756,329 @@ static void wx_refresh_cb(lv_event_t *e)
 {
     (void)e;
     ui_weather_refresh_if_needed(true);   /* 手动刷新：强制拉一次 */
+}
+
+/* ===================== 音乐播放（伪实现） =====================
+ * 需求：能从 SD 卡读到音频文件、能「播放」、有进度。
+ * 伪实现：扫描 /sdcard 下的音频文件，点列表即选曲；用定时器按真实时间推进进度条，
+ *         到尾自动下一首。不解码、不占用任何音频引脚、不真正出声。
+ * TODO（引脚确定后）：在 music_play() 里初始化 MP3 解码器，并把 music_timer_cb 里
+ *       的「定时器伪推进」改成「读一帧 PCM → 经 I2S 送到 DAC/功放」，即可真正出声。
+ * ============================================================== */
+#define MUSIC_MAX_FILES   64
+#define MUSIC_DIR         "/sdcard"
+
+static char       g_music_files[MUSIC_MAX_FILES][384];
+static int        g_music_count = 0;
+static int        g_music_cur   = -1;
+static int        g_music_pos   = 0;     /* 已播放毫秒（伪） */
+static int        g_music_dur   = 0;     /* 曲目总时长（秒，估算） */
+static bool       g_music_playing = false;
+static uint32_t   g_music_tick = 0;      /* 上次推进时的 lv_tick（ms） */
+static lv_timer_t *s_music_timer = NULL;
+
+static lv_obj_t  *g_music_title  = NULL;
+static lv_obj_t  *g_music_slider = NULL;
+static lv_obj_t  *g_music_time   = NULL;
+static lv_obj_t  *g_music_time_r = NULL;   /* 进度条右侧：总时长 */
+static lv_obj_t  *g_music_play_btn = NULL;
+static lv_obj_t  *g_music_play_lbl = NULL;
+
+static const char *music_base(const char *p)
+{
+    const char *s = strrchr(p, '/');
+    return s ? s + 1 : p;
+}
+
+static bool music_is_audio(const char *name)
+{
+    size_t n = strlen(name);
+    if (n < 4) return false;
+    const char *e = name + n - 4;
+    return strcasecmp(e, ".mp3") == 0 || strcasecmp(e, ".wav") == 0 ||
+           strcasecmp(e, ".flac") == 0 || strcasecmp(e, ".ogg") == 0;
+}
+
+/* 扫描 SD 卡根目录的音频文件 */
+static void music_scan(void)
+{
+    g_music_count = 0;
+    DIR *d = opendir(MUSIC_DIR);
+    if (!d) return;
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL && g_music_count < MUSIC_MAX_FILES) {
+        if (!music_is_audio(ent->d_name)) continue;
+        snprintf(g_music_files[g_music_count], sizeof(g_music_files[0]),
+                 "%s/%s", MUSIC_DIR, ent->d_name);
+        g_music_count++;
+    }
+    closedir(d);
+}
+
+/* 估算时长（秒）：尝试解析 MP3 第一帧得到比特率/采样率；失败按 ~128kbps 回退 */
+static int music_estimate_duration(const char *path)
+{
+    struct stat st;
+    if (stat(path, &st) != 0 || st.st_size <= 0) return 0;
+    long size = st.st_size;
+    FILE *f = fopen(path, "rb");
+    if (!f) return (int)(size / 16000);
+
+    int dur = 0;
+    unsigned char h[4];
+    /* 跳过 ID3v2 标签头（前 3 字节 "ID3"，后跟 7 字节长度） */
+    if (fread(h, 1, 3, f) == 3 && h[0] == 'I' && h[1] == 'D' && h[2] == 'D') {
+        unsigned char b[7];
+        if (fread(b, 1, 7, f) == 7) {
+            long len = ((long)b[2] << 21) | ((long)b[3] << 14) |
+                       ((long)b[4] << 7)  |  b[5];
+            fseek(f, 10 + len, SEEK_SET);
+        }
+    } else {
+        fseek(f, 0, SEEK_SET);
+    }
+    /* 在前 64KB 内定位第一个 MP3 帧同步字 0xFF 0xEx/Fx */
+    long scanned = 0;
+    while (scanned < 65536 && fread(h, 1, 4, f) == 4) {
+        if (h[0] == 0xFF && (h[1] & 0xE0) == 0xE0) {
+            int bi = (h[2] >> 4) & 0xF;   /* 比特率索引 */
+            int si = (h[2] >> 2) & 0x3;   /* 采样率索引 */
+            static const int br[16] = {0,32,40,48,56,64,80,96,112,128,160,192,224,256,320,0};
+            static const int sr[4]  = {44100,48000,32000,0};
+            int bitrate = br[bi], samplerate = sr[si];
+            if (bitrate > 0 && samplerate > 0) {
+                /* MPEG1 Layer III 帧大小（字节）与每帧样本数（1152） */
+                long frame = (144L * bitrate * 1000) / samplerate;
+                long off   = ftell(f) - 4;
+                long frames = (size - off) / frame;
+                if (frames > 0) dur = (int)(frames * 1152 / samplerate);
+                break;
+            }
+        }
+        fseek(f, -3, SEEK_CUR);
+        scanned++;
+    }
+    fclose(f);
+    if (dur <= 0) dur = (int)(size / 16000);   /* 回退：~128kbps */
+    return dur;
+}
+
+static void music_update_time(void)
+{
+    int s = g_music_pos / 1000;
+    char b1[16], b2[16];
+    snprintf(b1, sizeof(b1), "%d:%02d", s / 60, s % 60);
+    snprintf(b2, sizeof(b2), "%d:%02d", g_music_dur / 60, g_music_dur % 60);
+    lv_label_set_text(g_music_time, b1);     /* 左侧：当前 */
+    lv_label_set_text(g_music_time_r, b2);   /* 右侧：总时长 */
+}
+
+static void music_update_title(void)
+{
+    if (g_music_cur >= 0)
+        lv_label_set_text(g_music_title, music_base(g_music_files[g_music_cur]));
+}
+
+static void music_play(int idx)
+{
+    if (idx < 0 || idx >= g_music_count) return;
+    g_music_cur = idx;
+    g_music_dur = music_estimate_duration(g_music_files[idx]);
+    if (g_music_dur <= 0) g_music_dur = 1;
+    g_music_pos = 0;
+    g_music_playing = true;
+    g_music_tick = lv_tick_get();
+    music_update_title();
+    music_update_time();
+    lv_slider_set_value(g_music_slider, 0, LV_ANIM_OFF);
+    if (g_music_play_lbl) lv_label_set_text(g_music_play_lbl, "暂停");
+    /* TODO: 真正出声 —— 引脚确定后在这里初始化 MP3 解码器，并按真实播放速度
+     *       从文件读取 PCM 经 I2S 输出，再据此推进进度（而非下面的定时器伪推进）。 */
+}
+
+static void music_next(void)
+{
+    if (g_music_count == 0) return;
+    int n = g_music_cur + 1;
+    if (n >= g_music_count) {            /* 到末尾：停 */
+        g_music_playing = false;
+        if (g_music_play_lbl) lv_label_set_text(g_music_play_lbl, "播放");
+        return;
+    }
+    music_play(n);
+}
+
+static void music_slider_cb(lv_event_t *e)
+{
+    (void)e;
+    /* 只在用户拖动时 seek（程序更新进度条不触发） */
+    if (lv_obj_has_state(g_music_slider, LV_STATE_PRESSED) && g_music_dur > 0) {
+        int pct = lv_slider_get_value(g_music_slider);   /* 0..1000 */
+        g_music_pos = (int)((long long)g_music_dur * pct);  /* 毫秒 */
+        music_update_time();
+    }
+}
+
+static void music_prev_cb(lv_event_t *e)
+{
+    (void)e;
+    if (g_music_count == 0) return;
+    int p = g_music_cur - 1;
+    if (p < 0) p = 0;
+    music_play(p);
+}
+
+static void music_next_cb(lv_event_t *e)
+{
+    (void)e;
+    music_next();
+}
+
+static void music_toggle_cb(lv_event_t *e)
+{
+    (void)e;
+    if (g_music_cur < 0) {               /* 还没选曲就按播放：播第一首 */
+        if (g_music_count > 0) music_play(0);
+        return;
+    }
+    g_music_playing = !g_music_playing;
+    if (g_music_playing) g_music_tick = lv_tick_get();
+    if (g_music_play_lbl)
+        lv_label_set_text(g_music_play_lbl, g_music_playing ? "暂停" : "播放");
+}
+
+/* 伪播放推进：按真实时间累加进度（不出声、不解碼） */
+static void music_timer_cb(lv_timer_t *t)
+{
+    (void)t;
+    if (!g_music_playing || g_music_cur < 0) return;
+    uint32_t now = lv_tick_get();
+    uint32_t dt = now - g_music_tick;
+    g_music_tick = now;
+    g_music_pos += (int)dt;
+    int dur_ms = g_music_dur * 1000;
+    if (g_music_pos >= dur_ms) {
+        g_music_pos = dur_ms;
+        music_update_time();
+        lv_slider_set_value(g_music_slider, 1000, LV_ANIM_OFF);
+        music_next();
+        return;
+    }
+    music_update_time();
+    lv_slider_set_value(g_music_slider,
+                        (int)((long long)g_music_pos * 1000 / dur_ms), LV_ANIM_OFF);
+}
+
+static lv_obj_t *music_make_btn(lv_obj_t *parent, const char *txt, lv_event_cb_t cb)
+{
+    lv_obj_t *b = lv_button_create(parent);
+    lv_obj_set_size(b, 84, 36);
+    lv_obj_set_style_bg_color(b, lv_color_hex(0x2A2A38), 0);
+    lv_obj_set_style_radius(b, 18, 0);   /* 药丸形按钮 */
+    lv_obj_set_style_border_opa(b, LV_OPA_TRANSP, 0);
+    lv_obj_t *l = lv_label_create(b);
+    lv_label_set_text(l, txt);
+    lv_obj_set_style_text_font(l, &lv_font_cn_16, 0);
+    lv_obj_set_style_text_color(l, lv_color_white(), 0);
+    lv_obj_center(l);
+    lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, NULL);
+    return b;
+}
+
+static void build_music_screen(lv_obj_t *parent)
+{
+    music_scan();
+
+    /* 正在播放：专辑封面（程序绘制的黑胶唱片，免外部素材） */
+    lv_obj_t *cover = lv_obj_create(parent);
+    lv_obj_set_size(cover, 96, 96);
+    lv_obj_align(cover, LV_ALIGN_TOP_MID, 0, 60);
+    lv_obj_set_style_radius(cover, 48, 0);                       /* 正圆 */
+    lv_obj_set_style_bg_color(cover, lv_color_hex(0x3A2E5C), 0);
+    lv_obj_set_style_bg_grad_color(cover, lv_color_hex(0x1F6FEB), 0);
+    lv_obj_set_style_bg_grad_dir(cover, LV_GRAD_DIR_VER, 0);
+    lv_obj_set_style_bg_opa(cover, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_opa(cover, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_shadow_opa(cover, LV_OPA_40, 0);
+    lv_obj_set_style_shadow_color(cover, lv_color_black(), 0);
+    lv_obj_set_style_shadow_ofs_y(cover, 4, 0);
+    lv_obj_set_style_shadow_spread(cover, -2, 0);
+    lv_obj_clear_flag(cover, LV_OBJ_FLAG_SCROLLABLE);
+    /* 黑胶：内圆 + 灰边 + 红心 */
+    lv_obj_t *disc = lv_obj_create(cover);
+    lv_obj_set_size(disc, 66, 66);
+    lv_obj_center(disc);
+    lv_obj_set_style_radius(disc, 33, 0);
+    lv_obj_set_style_bg_color(disc, lv_color_hex(0x0E0E16), 0);
+    lv_obj_set_style_bg_opa(disc, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(disc, lv_color_hex(0x4A4A5A), 0);
+    lv_obj_set_style_border_width(disc, 2, 0);
+    lv_obj_set_style_border_opa(disc, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(disc, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *hole = lv_obj_create(disc);
+    lv_obj_set_size(hole, 14, 14);
+    lv_obj_center(hole);
+    lv_obj_set_style_radius(hole, 7, 0);
+    lv_obj_set_style_bg_color(hole, lv_color_hex(0xE53935), 0);
+    lv_obj_set_style_bg_opa(hole, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_opa(hole, LV_OPA_TRANSP, 0);
+    lv_obj_clear_flag(hole, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* 曲名 */
+    g_music_title = lv_label_create(parent);
+    lv_label_set_text(g_music_title, "未播放");
+    lv_obj_set_style_text_font(g_music_title, &lv_font_cn_16, 0);
+    lv_obj_set_style_text_color(g_music_title, lv_color_white(), 0);
+    lv_obj_align(g_music_title, LV_ALIGN_TOP_MID, 0, 162);
+
+    /* 进度条（主题色指示 + 圆形白 thumb），两侧时间 */
+    g_music_slider = lv_slider_create(parent);
+    lv_obj_set_size(g_music_slider, LCD_W - 60, 10);
+    lv_obj_align(g_music_slider, LV_ALIGN_TOP_MID, 0, 182);
+    lv_slider_set_range(g_music_slider, 0, 1000);
+    lv_obj_set_style_bg_color(g_music_slider, lv_color_hex(0x333344), 0);
+    lv_obj_set_style_radius(g_music_slider, 5, 0);
+    lv_obj_set_style_bg_color(g_music_slider, lv_color_hex(0x2BB673), LV_PART_INDICATOR);
+    lv_obj_set_style_radius(g_music_slider, 5, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(g_music_slider, lv_color_white(), LV_PART_KNOB);
+    lv_obj_set_style_radius(g_music_slider, LV_RADIUS_CIRCLE, LV_PART_KNOB);
+    lv_obj_set_style_width(g_music_slider, 14, LV_PART_KNOB);
+    lv_obj_set_style_height(g_music_slider, 14, LV_PART_KNOB);
+    lv_obj_set_style_bg_opa(g_music_slider, LV_OPA_COVER, LV_PART_KNOB);
+    lv_obj_set_style_shadow_opa(g_music_slider, LV_OPA_30, LV_PART_KNOB);
+    lv_obj_add_event_cb(g_music_slider, music_slider_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    g_music_time = lv_label_create(parent);     /* 左侧：当前 */
+    lv_label_set_text(g_music_time, "0:00");
+    lv_obj_set_style_text_font(g_music_time, &lv_font_cn_16, 0);
+    lv_obj_set_style_text_color(g_music_time, lv_color_hex(0xAAAAAA), 0);
+    lv_obj_align(g_music_time, LV_ALIGN_TOP_LEFT, 6, 182);
+    g_music_time_r = lv_label_create(parent);   /* 右侧：总时长 */
+    lv_label_set_text(g_music_time_r, "0:00");
+    lv_obj_set_style_text_font(g_music_time_r, &lv_font_cn_16, 0);
+    lv_obj_set_style_text_color(g_music_time_r, lv_color_hex(0xAAAAAA), 0);
+    lv_obj_align(g_music_time_r, LV_ALIGN_TOP_RIGHT, -6, 182);
+
+    /* 控制按钮行：上一首 / 播放暂停 / 下一首（无列表，纯播放控制） */
+    lv_obj_t *row = lv_obj_create(parent);
+    lv_obj_set_size(row, LCD_W, 34);
+    lv_obj_align(row, LV_ALIGN_TOP_MID, 0, 206);
+    lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_opa(row, LV_OPA_TRANSP, 0);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_pad_column(row, 16, 0);
+
+    music_make_btn(row, "上一首", music_prev_cb);
+    g_music_play_btn = music_make_btn(row, "播放", music_toggle_cb);
+    lv_obj_set_width(g_music_play_btn, 104);
+    lv_obj_set_style_bg_color(g_music_play_btn, lv_color_hex(0x2BB673), 0);  /* 主题色突出 */
+    g_music_play_lbl = lv_obj_get_child(g_music_play_btn, 0);
+    music_make_btn(row, "下一首", music_next_cb);
+
+    /* 伪播放定时器：每 200ms 推进一次进度（不解码、不出声） */
+    if (!s_music_timer) s_music_timer = lv_timer_create(music_timer_cb, 200, NULL);
 }
 
 static void build_weather_screen(lv_obj_t *parent)
@@ -2299,6 +2635,10 @@ static void build_novel_screen(lv_obj_t *scr)
     lv_obj_set_style_bg_color(bar, lv_color_hex(0x16161F), 0);
     lv_obj_set_style_radius(bar, 0, 0);
     lv_obj_set_style_border_opa(bar, LV_OPA_TRANSP, 0);
+    /* 返回栏是纯展示条，关掉滚动（否则 lv_obj_create 默认带 SCROLLABLE，
+     * 整条栏会被手指拖动上下滑，既无作用又空耗 LVGL 滚动引擎） */
+    lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(bar, LV_SCROLLBAR_MODE_OFF);
     lv_obj_set_flex_flow(bar, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(bar, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_hor(bar, 8, 0);
@@ -2771,7 +3111,7 @@ static void ui_handle_pending_app(void)
         scr = g_clock_screen;
         break;
     case APP_MUSIC:
-        if (!g_music_screen) { g_music_screen = make_app_screen("音乐"); add_placeholder(g_music_screen, "音乐\n(暂未实现)"); }
+        if (!g_music_screen) { g_music_screen = make_app_screen("音乐"); build_music_screen(g_music_screen); }
         scr = g_music_screen;
         break;
     case APP_GAME:
@@ -3051,7 +3391,6 @@ static void lvgl_task(void *arg)
         ui_weather_screen_refresh();
         ui_pcmon_screen_refresh();
         file_mgr_periodic();          /* 文件管理：挂载 / 列目录 / 预览 / 删除 */
-        media_periodic();             /* 图片/视频：MJPEG 逐帧解码 + 刷屏 */
 
         /* 延迟任务：密码面板、App 跳转、触摸红点、WiFi 列表刷新 */
         ui_handle_pending_password();

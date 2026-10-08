@@ -27,9 +27,9 @@
 #include "sd_card.h"      /* SD_MOUNT_POINT */
 #include "ui.h"           /* ui_set_status_bar_visible */
 
-/* MJPEG 解码直接用 LVGL 自带的 Tiny JPEG 解码器（编译进 LVGL，符号可链接） */
+/* 图片 JPG 解码用 LVGL 自带的 Tiny JPEG 解码器（编译进 LVGL，符号可链接） */
 #if !LV_USE_TJPGD
-#error "MJPEG 播放需要 LVGL 的 TJPGD：请开启 CONFIG_LV_USE_TJPGD=y"
+#error "图片 JPG 解码需要 LVGL 的 TJPGD：请开启 CONFIG_LV_USE_TJPGD=y"
 #endif
 #include "libs/tjpgd/tjpgd.h"
 
@@ -39,16 +39,7 @@ LV_FONT_DECLARE(lv_font_cn_16);
 static const char *TAG = "MEDIA";
 
 /* tjpgd 工作区（TJpgDec 建议 4096） */
-#define MJPEG_POOL_SIZE   4096
-/* 单帧 JPEG 缓冲（PSRAM）：先只开 64KB，遇到更大的帧再按需 realloc，
- * 上限 512KB。320x240 的 MJPEG 一帧一般 5~15KB，没必要一上来就占掉半兆 PSRAM。 */
-#define MJPEG_FRAME_BUF_MIN (64 * 1024)
-#define MJPEG_FRAME_BUF_MAX (512 * 1024)
-/* 超过这个大小的帧提示一下：该重新编码成 320x240 了 */
-#define MJPEG_FRAME_WARN    (64 * 1024)
-/* 裸 .mjpeg/.mjpg 没有容器/时间戳，帧率只能固定（微秒/帧，默认 15fps）。
- * 源片若是其他帧率：改这里，或用 ffmpeg -i x -c:v copy out.avi 套容器保留原帧率。 */
-#define MJPEG_RAW_FRAME_US  66667
+#define JPEG_POOL_SIZE   4096
 
 /* ------------------------------ 文件名判断 ------------------------------ */
 
@@ -62,12 +53,7 @@ static bool ext_is(const char *name, const char *ext)
 bool media_is_image(const char *name)
 {
     return ext_is(name, ".jpg") || ext_is(name, ".jpeg") ||
-           ext_is(name, ".png") || ext_is(name, ".bmp");
-}
-
-bool media_is_video(const char *name)
-{
-    return ext_is(name, ".avi") || ext_is(name, ".mjpeg") || ext_is(name, ".mjpg");
+           ext_is(name, ".png");
 }
 
 static const char *base_name(const char *path)
@@ -92,7 +78,7 @@ static void make_lvgl_path(char *out, size_t n, const char *full)
 
 /* ------------------------------ 全局状态 ------------------------------ */
 
-typedef enum { MEDIA_IDLE = 0, MEDIA_IMAGE, MEDIA_VIDEO } media_mode_t;
+typedef enum { MEDIA_IDLE = 0, MEDIA_IMAGE } media_mode_t;
 
 static media_mode_t s_mode = MEDIA_IDLE;
 static lv_obj_t    *s_return_scr = NULL;      /* 退出时回到哪个界面 */
@@ -105,39 +91,22 @@ static lv_obj_t *s_img_view = NULL;
 static lv_obj_t *s_img_name = NULL;
 static lv_obj_t *s_img_msg  = NULL;   /* 解码失败时的居中提示（别再让人看一片黑） */
 
-/* ---- 视频播放界面 ---- */
-static lv_obj_t *s_vid_scr  = NULL;
-static lv_obj_t *s_vid_ctrl = NULL;
-static lv_obj_t *s_vid_lbl  = NULL;
-
 /* ---- 图片：解码后的 RGB565 缓冲（PSRAM）+ 给 LVGL 的描述符 ---- */
 static uint8_t      *s_img_buf = NULL;
 static lv_image_dsc_t s_img_dsc = {0};
 static int           s_jpeg_w = 0, s_jpeg_h = 0;   /* 最近一次解出来的原图尺寸（日志用） */
 
-/* ---- 视频运行状态 ---- */
-static FILE      *s_avi = NULL;
-static long       s_movi_start = 0, s_movi_end = 0, s_pos = 0;
-static uint32_t   s_frame_us = 66667;         /* 默认 15fps */
-static int        s_frame_idx = 0, s_frame_total = 0;
-static bool       s_paused = false;
-static int64_t    s_next_frame_us = 0;
-static int        s_fail_streak = 0;        /* 连续解码失败次数 */
-static bool       s_warned_not_jpeg = false; /* 「不是 JPEG」只提示一次，别刷屏 */
-static bool       s_raw_mjpeg = false;       /* true=裸 .mjpeg/.mjpg 流（无 AVI 容器） */
-static bool       s_first_flush = false;     /* 本次播放的第一帧（需先排空 LVGL 切屏事务） */
-
 /* ---- JPEG 解码状态 ----
  * 关键：tjpgd 是流式解码（MCU 一块一块出），所以不管原图多大，
- * 都不需要整帧缓冲——边解边按目标尺寸抽稀写进 framebuffer 就行。 */
+ * 都不需要整帧缓冲——边解边按目标尺寸抽稀写进缓冲就行。 */
 typedef struct {
-    const uint8_t *mem;                       /* 内存数据源（视频帧） */
+    const uint8_t *mem;                       /* 内存数据源（图片用 .f，保留兼容） */
     size_t         size, pos;
     FILE          *f;                         /* 文件数据源（图片，可边读边解） */
 } jpg_src_t;
 
 typedef struct {
-    uint8_t *dst;                             /* 目标缓冲（图片=PSRAM 的 RGB565 图，视频=g_framebuffer） */
+    uint8_t *dst;                             /* 目标缓冲（图片=PSRAM 的 RGB565 图） */
     int      dst_w, dst_h;                    /* 目标缓冲的宽高（像素） */
     int ox, oy, ow, oh;                       /* 输出区域（已居中、保持比例） */
     int src_w, src_h;
@@ -147,318 +116,10 @@ typedef struct {
 static blit_ctx_t s_blit;
 static uint32_t   s_blit_rows = 0;            /* 解码计数，用于周期性让出 CPU */
 static uint8_t   *s_pool = NULL;              /* tjpgd 工作区（内部 RAM，快） */
-static uint8_t   *s_jpg_buf = NULL;           /* 单帧 JPEG（PSRAM，按需增长） */
-static size_t     s_jpg_buf_size = 0;
 
-/* ------------------------------ AVI 解析 ------------------------------ */
+/* --------------------------- JPEG 解码 + 写缓冲 --------------------------- */
 
-static uint32_t rd32(const uint8_t *p)
-{
-    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
-           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-}
-
-static void avi_close(void)
-{
-    if (s_avi) {
-        fclose(s_avi);
-        s_avi = NULL;
-    }
-}
-
-/* AVI 里的信息（帧率、总帧数、movi 位置、视频编码 fourcc） */
-typedef struct {
-    long     movi_start, movi_end;
-    uint32_t frame_us;
-    int      total_frames;
-    uint32_t codec;             /* strf 里的 biCompression，'MJPG' 才是我们能解码的 */
-    int      width, height;
-} avi_info_t;
-
-static void fcc_str(uint32_t fcc, char out[5])
-{
-    out[0] = (char)(fcc & 0xFF);
-    out[1] = (char)((fcc >> 8) & 0xFF);
-    out[2] = (char)((fcc >> 16) & 0xFF);
-    out[3] = (char)((fcc >> 24) & 0xFF);
-    out[4] = '\0';
-}
-
-/* 递归扫 RIFF 块：avih 在 LIST 'hdrl' 里，视频编码在 hdrl→strl→strf 里，
- * 帧数据在 LIST 'movi' 里。depth 限制递归层数，防止坏文件把栈跑穿。 */
-static void avi_scan(long start, long end, int depth, avi_info_t *info)
-{
-    bool vids_pending = false;              /* 刚读过 'vids' 的 strh，下一个 strf 是视频格式 */
-
-    long pos = start;
-    while (pos + 8 <= end) {
-        uint8_t ch[8];
-        fseek(s_avi, pos, SEEK_SET);
-        if (fread(ch, 1, 8, s_avi) != 8) break;
-        uint32_t sz = rd32(ch + 4);
-
-        if (memcmp(ch, "LIST", 4) == 0) {
-            char type[4];
-            if (fread(type, 1, 4, s_avi) != 4) break;
-            if (memcmp(type, "movi", 4) == 0) {
-                info->movi_start = pos + 12;
-                info->movi_end   = pos + 8 + (long)sz;
-                return;                     /* 后面只有索引，不用看了 */
-            }
-            if (depth < 3) {
-                avi_scan(pos + 12, pos + 8 + (long)sz, depth + 1, info);
-            }
-        } else if (memcmp(ch, "avih", 4) == 0) {
-            uint8_t avih[32];
-            if (fread(avih, 1, 32, s_avi) == 32) {
-                uint32_t uspf = rd32(avih);            /* dwMicroSecPerFrame */
-                if (uspf >= 2000 && uspf <= 500000) info->frame_us = uspf;
-                info->total_frames = (int)rd32(avih + 16);
-            }
-        } else if (memcmp(ch, "strh", 4) == 0) {
-            uint8_t strh[8];
-            if (fread(strh, 1, 8, s_avi) == 8) {
-                vids_pending = (memcmp(strh, "vids", 4) == 0);
-                if (vids_pending && !info->codec) {
-                    /* 先记下 strh 里的 handler（有的文件 strf 缺失/是 RGB） */
-                    uint32_t handler = rd32(strh + 4);
-                    if (handler != 0) info->codec = handler;
-                }
-            }
-        } else if (memcmp(ch, "strf", 4) == 0 && vids_pending) {
-            uint8_t bih[40];
-            if (fread(bih, 1, 40, s_avi) == 40) {
-                info->width  = (int)(int32_t)rd32(bih + 4);
-                info->height = (int)(int32_t)rd32(bih + 8);
-                info->codec  = rd32(bih + 16);         /* biCompression */
-            }
-            vids_pending = false;
-        }
-        pos += 8 + (long)sz + ((sz & 1) ? 1 : 0);
-    }
-}
-
-/* 打开 AVI：确认是 MJPEG 编码才让播，否则直接说清楚是什么编码 */
-static bool avi_open(const char *path)
-{
-    s_raw_mjpeg = false;
-    s_avi = fopen(path, "rb");
-    if (!s_avi) {
-        ESP_LOGW(TAG, "打开失败: %s", path);
-        return false;
-    }
-    fseek(s_avi, 0, SEEK_END);
-    long fsize = ftell(s_avi);
-    fseek(s_avi, 0, SEEK_SET);
-
-    uint8_t h[12];
-    if (fread(h, 1, 12, s_avi) != 12 || memcmp(h, "RIFF", 4) != 0 || memcmp(h + 8, "AVI ", 4) != 0) {
-        ESP_LOGW(TAG, "不是 AVI: %s", path);
-        avi_close();
-        return false;
-    }
-
-    avi_info_t info = {
-        .movi_start = 0, .movi_end = 0,
-        .frame_us = 66667,                /* 15fps 兜底 */
-        .total_frames = 0, .codec = 0, .width = 0, .height = 0,
-    };
-    avi_scan(12, fsize, 0, &info);
-
-    if (info.movi_start <= 0 || info.movi_end <= info.movi_start) {
-        ESP_LOGW(TAG, "没找到 movi 数据块: %s", path);
-        avi_close();
-        return false;
-    }
-
-    /* 必须是 MJPEG（fourcc 'MJPG'）；H.264/XVID 这些软解跑不动，直接拒绝并说明白 */
-    char fcc[5];
-    fcc_str(info.codec, fcc);
-    if (info.codec != 0x47504A4D) {          /* 0x47504A4D = 'MJPG' (小端读出来) */
-        ESP_LOGE(TAG, "不支持的视频编码: %s（只支持 MJPEG）", fcc[0] ? fcc : "未知");
-        ESP_LOGE(TAG, "请用: ffmpeg -i 原视频 -vf scale=320:240 -r 15 -c:v mjpeg -q:v 4 -an out.avi");
-        avi_close();
-        return false;
-    }
-
-    s_movi_start  = info.movi_start;
-    s_movi_end    = info.movi_end;
-    s_frame_us    = info.frame_us;
-    s_frame_total = info.total_frames;
-    s_pos         = s_movi_start;
-    s_frame_idx   = 0;
-    s_fail_streak = 0;
-    s_warned_not_jpeg = false;
-    ESP_LOGI(TAG, "AVI 打开: %s  %dx%d  %s  %u fps  总帧数 %d  movi[%ld,%ld]",
-             path, info.width, info.height, fcc,
-             (unsigned)(1000000u / s_frame_us), s_frame_total, s_movi_start, s_movi_end);
-    return true;
-}
-
-/* 读下一帧 JPEG 到 s_jpg_buf，返回长度；false = 播完/出错 */
-static bool avi_next_frame(size_t *out_len)
-{
-    while (s_pos + 8 <= s_movi_end) {
-        uint8_t ch[8];
-        fseek(s_avi, s_pos, SEEK_SET);
-        if (fread(ch, 1, 8, s_avi) != 8) return false;
-        uint32_t sz = rd32(ch + 4);
-        long data = s_pos + 8;
-        s_pos = data + (long)sz + ((sz & 1) ? 1 : 0);
-
-        if ((memcmp(ch, "00dc", 4) == 0 || memcmp(ch, "00db", 4) == 0) && sz > 32) {
-            /* 缓冲不够就扩容（高分辨率 MJPEG 一帧能到几百 KB） */
-            if (sz > s_jpg_buf_size) {
-                if (sz > MJPEG_FRAME_BUF_MAX) {
-                    ESP_LOGW(TAG, "帧过大 %u 字节，跳过（请用 ffmpeg 转成 320x240 的 MJPEG）",
-                             (unsigned)sz);
-                    continue;
-                }
-                uint8_t *nb = (uint8_t *)heap_caps_realloc(s_jpg_buf, sz, MALLOC_CAP_SPIRAM);
-                if (!nb) {
-                    ESP_LOGW(TAG, "第 %d 帧 %u 字节，缓冲扩容失败，跳过",
-                             s_frame_idx + 1, (unsigned)sz);
-                    continue;
-                }
-                s_jpg_buf = nb;
-                s_jpg_buf_size = sz;
-                ESP_LOGI(TAG, "帧缓冲扩到 %u 字节", (unsigned)s_jpg_buf_size);
-            }
-            if (sz > MJPEG_FRAME_WARN) {
-                ESP_LOGW(TAG, "第 %d 帧 %u 字节偏大，解码会慢；建议转成 320x240",
-                         s_frame_idx + 1, (unsigned)sz);
-            }
-            fseek(s_avi, data, SEEK_SET);
-            if (fread(s_jpg_buf, 1, sz, s_avi) != sz) return false;
-            /* 帧开头必须是 JPEG 的 SOI（FF D8），不是就别浪费时间去解码 */
-            if (s_jpg_buf[0] != 0xFF || s_jpg_buf[1] != 0xD8) {
-                if (!s_warned_not_jpeg) {
-                    s_warned_not_jpeg = true;
-                    ESP_LOGW(TAG, "帧数据不是 JPEG（没有 FF D8 开头），这不是 MJPEG 文件");
-                }
-                continue;
-            }
-            *out_len = sz;
-            s_frame_idx++;
-            return true;
-        }
-    }
-    return false;
-}
-
-/* ------------------------ 裸 MJPEG 流（.mjpeg/.mjpg） ------------------------ */
-
-#define RAW_READ_CHUNK 1024
-
-/* 裸流没有容器头：文件本身就是一串紧挨着的 JPEG（FFD8…FFD9）。
- * 帧率固定用 MJPEG_RAW_FRAME_US，总帧数未知（暂停界面只显示"第 N 帧"）。 */
-static bool raw_open(const char *path)
-{
-    s_avi = fopen(path, "rb");
-    if (!s_avi) {
-        ESP_LOGW(TAG, "打开失败: %s", path);
-        return false;
-    }
-    uint8_t soi[2];
-    if (fread(soi, 1, 2, s_avi) != 2 || soi[0] != 0xFF || soi[1] != 0xD8) {
-        ESP_LOGW(TAG, "不是裸 MJPEG（开头不是 FF D8）: %s", path);
-        avi_close();
-        return false;
-    }
-    fseek(s_avi, 0, SEEK_SET);               /* raw_next_frame 每次自己定位 SOI */
-
-    s_raw_mjpeg   = true;
-    s_movi_start  = 0;
-    s_movi_end    = 0;
-    s_pos         = 0;
-    s_frame_us    = MJPEG_RAW_FRAME_US;
-    s_frame_total = 0;
-    s_frame_idx   = 0;
-    s_fail_streak = 0;
-    s_warned_not_jpeg = false;
-    ESP_LOGI(TAG, "裸 MJPEG 打开: %s  固定 %u fps（容器无时间戳）",
-             path, (unsigned)(1000000u / s_frame_us));
-    return true;
-}
-
-/* 读下一帧 JPEG 到 s_jpg_buf，返回长度；false = 播完/出错。
- * 直接往帧缓冲尾部顺序读、原地找帧尾 FF D9（EOI）：JPEG 熵编码里的 FF 都按 FF00
- * 转义，所以 FF D9 只会出现在真正的帧尾，直接搜字节对即可，got_ff 只用来跨块。
- * 不用额外栈缓冲，也没有二次 memcpy；缓冲扩容/上限与 AVI 版一致，超大帧排空跳过。 */
-static bool raw_next_frame(size_t *out_len)
-{
-    for (;;) {
-        /* 1. 定位下一帧开头 FF D8（顺带容忍帧间杂字节；正常紧挨时只读 2 字节） */
-        bool found_soi = false;
-        int prev = -1, ch;
-        while ((ch = fgetc(s_avi)) != EOF) {
-            if (prev == 0xFF && ch == 0xD8) { found_soi = true; break; }
-            prev = (ch == 0xFF) ? 0xFF : -1;
-        }
-        if (!found_soi) return false;
-
-        /* 2. 直接读到帧缓冲尾部，原地扫 EOI（SOI 两字节先放进去） */
-        size_t len = 0;
-        s_jpg_buf[len++] = 0xFF;
-        s_jpg_buf[len++] = 0xD8;
-        bool got_ff = false;
-        bool discard = false;
-        bool have_frame = false;
-        bool frame_ok = false;
-
-        while (!have_frame) {
-            if (!discard && len >= s_jpg_buf_size) {
-                if (len >= MJPEG_FRAME_BUF_MAX) {
-                    ESP_LOGW(TAG, "帧过大（>%d 字节），跳过（请用 ffmpeg 转成 320x240）",
-                             MJPEG_FRAME_BUF_MAX);
-                    discard = true;
-                } else {
-                    size_t ns = s_jpg_buf_size * 2;
-                    if (ns > MJPEG_FRAME_BUF_MAX) ns = MJPEG_FRAME_BUF_MAX;
-                    uint8_t *nb = (uint8_t *)heap_caps_realloc(s_jpg_buf, ns, MALLOC_CAP_SPIRAM);
-                    if (!nb) {
-                        ESP_LOGW(TAG, "第 %d 帧缓冲扩容失败，跳过", s_frame_idx + 1);
-                        discard = true;
-                    } else {
-                        s_jpg_buf = nb;
-                        s_jpg_buf_size = ns;
-                        ESP_LOGI(TAG, "帧缓冲扩到 %u 字节", (unsigned)ns);
-                    }
-                }
-            }
-
-            /* 丢弃模式下往缓冲头部覆写（只为排空数据，内容不留） */
-            uint8_t *dst = discard ? s_jpg_buf : (s_jpg_buf + len);
-            size_t want = discard ? RAW_READ_CHUNK : (s_jpg_buf_size - len);
-            if (want > RAW_READ_CHUNK) want = RAW_READ_CHUNK;
-            size_t rd = fread(dst, 1, want, s_avi);
-            if (rd == 0) return false;           /* 文件结束，最后一帧不完整 */
-
-            size_t cut = rd;                     /* EOI 落在块内时，实际只消费到这里 */
-            for (size_t i = 0; i < rd; i++) {
-                if (got_ff && dst[i] == 0xD9) { cut = i + 1; have_frame = true; break; }
-                got_ff = (dst[i] == 0xFF);
-            }
-            /* EOI 之后多读的字节（帧间间隙/下一帧开头）退还给流，避免漏帧 */
-            if (have_frame && cut < rd) {
-                fseek(s_avi, -((long)(rd - cut)), SEEK_CUR);
-            }
-            if (!discard) len += cut;
-            if (have_frame) frame_ok = !discard;
-        }
-
-        if (frame_ok) {
-            *out_len = len;
-            s_frame_idx++;
-            return true;
-        }
-        /* 超大帧已排空，外层循环继续找下一 SOI */
-    }
-}
-
-/* --------------------------- MJPEG 解码 + 写帧缓冲 --------------------------- */
-
-/* tjpgd 的数据源：内存（视频帧）或 FILE*（图片，边读边解，不占大缓冲）
+/* tjpgd 的数据源：FILE*（图片，边读边解，不占大缓冲）
  *
  * 关键：tjpgd 调用 jd->infunc(jd, NULL, len) 时是要求「跳过 len 字节」
  * （跳过 EXIF / APPn / 注释等它不认识的段，见 tjpgd.c: if(jd->infunc(jd, 0, len) != len) return JDR_INP;）。
@@ -513,7 +174,9 @@ static int jpg_out(JDEC *jd, void *bitmap, JRECT *rect)
         uint8_t *row = &c->dst[(uint32_t)dy * (uint32_t)c->dst_w * 2];
         for (uint32_t x = rect->left; x <= rect->right; x++) {
             int dx = c->dx_map[x];
-            uint16_t c565 = (uint16_t)(((pix[0] >> 3) << 11) | ((pix[1] >> 2) << 5) | (pix[2] >> 3));
+            /* tjpgd 的 out 回调喂的是 BGR（见 tjpgd.c 里 B/G/R 顺序的注释），
+             * 故 R 取 pix[2]、B 取 pix[0] */
+            uint16_t c565 = (uint16_t)(((pix[2] >> 3) << 11) | ((pix[1] >> 2) << 5) | (pix[0] >> 3));
             uint32_t idx = (uint32_t)dx * 2;
             row[idx]     = (uint8_t)(c565 & 0xFF);     /* 低字节在前（小端） */
             row[idx + 1] = (uint8_t)(c565 >> 8);
@@ -523,11 +186,11 @@ static int jpg_out(JDEC *jd, void *bitmap, JRECT *rect)
     return 1;                                          /* 1 = 继续解码 */
 }
 
-/* tjpgd 的工作区（4KB，放内部 RAM 快一点），图片和视频共用 */
+/* tjpgd 的工作区（4KB，放内部 RAM 快一点） */
 static bool ensure_pool(void)
 {
     if (!s_pool) {
-        s_pool = (uint8_t *)heap_caps_malloc(MJPEG_POOL_SIZE, MALLOC_CAP_INTERNAL);
+        s_pool = (uint8_t *)heap_caps_malloc(JPEG_POOL_SIZE, MALLOC_CAP_INTERNAL);
     }
     if (!s_pool) {
         ESP_LOGE(TAG, "tjpgd 工作区分配失败");
@@ -560,7 +223,7 @@ static bool jpeg_blit_to(jpg_src_t *src, uint8_t *dst, int dst_w, int dst_h,
     if (!ensure_pool()) return false;
 
     JDEC jd;
-    JRESULT rc = jd_prepare(&jd, jpg_in, s_pool, MJPEG_POOL_SIZE, src);
+    JRESULT rc = jd_prepare(&jd, jpg_in, s_pool, JPEG_POOL_SIZE, src);
     if (rc != JDR_OK) {
         ESP_LOGW(TAG, "jd_prepare: %s (%d)", jres_str(rc), (int)rc);
         return false;
@@ -862,11 +525,11 @@ static void img_show(const char *path)
         img_fail("无法识别的图片\n%s", s_lvgl_path);
         return;
     }
-    /* PNG/BMP 会被 LVGL 整帧解码成 ARGB8888（宽*高*4），
-     * 屏幕才 320x240，再大纯属浪费内存，直接提示转 JPG */
+    /* PNG 交给 LVGL 整帧解码成 ARGB8888（宽*高*4），屏幕才 320x240，
+     * 再大纯属浪费内存，直接提示转 JPG */
     const uint32_t max_px = (uint32_t)LCD_W * (uint32_t)LCD_H;   /* 76800 */
     if ((uint64_t)hdr.w * hdr.h > max_px) {
-        img_fail("PNG/BMP 只支持到 %dx%d\n这张是 %dx%d，请转成 JPG",
+        img_fail("PNG 只支持到 %dx%d\n这张是 %dx%d，请转成 JPG",
                  LCD_W, LCD_H, (int)hdr.w, (int)hdr.h);
         return;
     }
@@ -940,242 +603,10 @@ void media_image_open(const char *path)
     img_show(path);
 }
 
-/* ------------------------------ 视频播放界面 ------------------------------ */
-
-static void vid_pause_cb(lv_event_t *e);
-static void vid_resume_cb(lv_event_t *e);
-
-static void build_vid_screen(void)
-{
-    s_vid_scr = lv_obj_create(NULL);
-    lv_obj_set_style_bg_color(s_vid_scr, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(s_vid_scr, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(s_vid_scr, 0, 0);
-    lv_obj_set_style_border_opa(s_vid_scr, LV_OPA_TRANSP, 0);
-    lv_obj_clear_flag(s_vid_scr, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_scrollbar_mode(s_vid_scr, LV_SCROLLBAR_MODE_OFF);
-
-    /* 整屏透明按钮：轻触暂停（视频是直写 framebuffer 的，屏幕上盖不了实体控件） */
-    lv_obj_t *tap = lv_button_create(s_vid_scr);
-    lv_obj_set_size(tap, LCD_W, LCD_H);
-    lv_obj_align(tap, LV_ALIGN_TOP_LEFT, 0, 0);
-    lv_obj_set_style_bg_opa(tap, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_opa(tap, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_shadow_opa(tap, LV_OPA_TRANSP, 0);
-    lv_obj_add_event_cb(tap, vid_pause_cb, LV_EVENT_CLICKED, NULL);
-
-    /* 暂停时才出现的控制条 */
-    s_vid_ctrl = lv_obj_create(s_vid_scr);
-    lv_obj_set_size(s_vid_ctrl, 240, 110);
-    lv_obj_align(s_vid_ctrl, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_style_bg_color(s_vid_ctrl, lv_color_hex(0x16161F), 0);
-    lv_obj_set_style_bg_opa(s_vid_ctrl, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(s_vid_ctrl, 12, 0);
-    lv_obj_set_style_border_opa(s_vid_ctrl, LV_OPA_TRANSP, 0);
-    lv_obj_set_flex_flow(s_vid_ctrl, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(s_vid_ctrl, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_row(s_vid_ctrl, 10, 0);
-    lv_obj_add_flag(s_vid_ctrl, LV_OBJ_FLAG_HIDDEN);
-
-    s_vid_lbl = lv_label_create(s_vid_ctrl);
-    lv_label_set_text(s_vid_lbl, "");
-    lv_obj_set_style_text_font(s_vid_lbl, &lv_font_cn_16, 0);
-    lv_obj_set_style_text_color(s_vid_lbl, lv_color_white(), 0);
-
-    lv_obj_t *row = lv_obj_create(s_vid_ctrl);
-    lv_obj_set_size(row, 220, 40);
-    lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_opa(row, LV_OPA_TRANSP, 0);
-    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    make_bar_btn(row, "继续", 96, vid_resume_cb);
-    make_bar_btn(row, "退出", 96, media_close_btn_cb);
-}
-
-static void vid_pause_cb(lv_event_t *e)
-{
-    (void)e;
-    if (s_mode != MEDIA_VIDEO || s_paused) return;
-    s_paused = true;
-    if (s_frame_total > 0) {
-        lv_label_set_text_fmt(s_vid_lbl, "第 %d / %d 帧  已暂停", s_frame_idx, s_frame_total);
-    } else {
-        lv_label_set_text_fmt(s_vid_lbl, "第 %d 帧  已暂停", s_frame_idx);
-    }
-    lv_obj_clear_flag(s_vid_ctrl, LV_OBJ_FLAG_HIDDEN);
-}
-
-static void vid_resume_cb(lv_event_t *e)
-{
-    (void)e;
-    lv_obj_add_flag(s_vid_ctrl, LV_OBJ_FLAG_HIDDEN);
-    s_paused = false;
-    s_next_frame_us = esp_timer_get_time();
-}
-
-static void media_toast(const char *text);   /* 定义在文件末尾 */
-
-void media_video_play(const char *path)
-{
-    if (!s_jpg_buf) {
-        s_jpg_buf = (uint8_t *)heap_caps_malloc(MJPEG_FRAME_BUF_MIN, MALLOC_CAP_SPIRAM);
-        s_jpg_buf_size = s_jpg_buf ? MJPEG_FRAME_BUF_MIN : 0;
-    }
-    if (!s_jpg_buf || !ensure_pool()) {
-        ESP_LOGE(TAG, "播放缓冲分配失败");
-        media_toast("内存不足，无法播放");
-        return;
-    }
-
-    /* .avi 走容器解析；.mjpeg/.mjpg 走裸流（按 FFD8/FFD9 切帧） */
-    bool is_raw = !ext_is(path, ".avi");
-    bool opened = is_raw ? raw_open(path) : avi_open(path);
-    if (!opened) {
-        /* 具体原因（编码不是 MJPEG / 打不开 / 没有 movi / 不是 JPEG 头）已打过日志 */
-        ESP_LOGE(TAG, "无法播放: %s（见上面的原因）", path);
-        media_toast(is_raw ? "无法播放：不是有效的裸 MJPEG 文件\n（文件开头应为 FF D8）"
-                           : "无法播放：只支持 MJPEG 编码的 AVI\n"
-                             "请用 ffmpeg 转: -c:v mjpeg（详见日志）");
-        return;
-    }
-
-    snprintf(s_path, sizeof(s_path), "%s", path);
-    if (!s_vid_scr) build_vid_screen();
-
-    s_return_scr   = lv_screen_active();
-    s_mode         = MEDIA_VIDEO;
-    s_paused       = false;
-
-    lv_obj_add_flag(s_vid_ctrl, LV_OBJ_FLAG_HIDDEN);
-    lv_screen_load(s_vid_scr);
-    ui_set_status_bar_visible(false);        /* 全屏播放，状态栏让位 */
-
-    /* 不在此处清屏/刷屏：播放动作发生在 lv_timer_handler 内部，此刻塞一个读
-     * g_framebuffer 的全屏 DMA 事务，会和 LVGL 切屏产生的一串 partial 事务
-     * （队列深度 6）交错，下一圈解码再覆写 g_framebuffer 就和 DMA 抢缓冲 → 花屏。
-     * 黑屏交给 s_vid_scr 自身渲染（partial 读的是内部 draw buf，不碰 g_framebuffer），
-     * 第一帧解码成功后 jpeg_blit_to 会先清黑再整屏输出。 */
-    s_first_flush  = true;
-    s_next_frame_us = esp_timer_get_time();
-}
-
 /* ------------------------------ 对外接口 ------------------------------ */
-
-/* 轻提示：播放失败时给用户一个看得见的反馈（4 秒后自动消失） */
-static lv_obj_t *s_toast = NULL;
-static lv_obj_t *s_toast_lbl = NULL;
-static int64_t   s_toast_until = 0;
-
-static void media_toast(const char *text)
-{
-    if (!s_toast) {
-        s_toast = lv_obj_create(lv_layer_top());
-        lv_obj_set_width(s_toast, LCD_W - 40);
-        lv_obj_align(s_toast, LV_ALIGN_BOTTOM_MID, 0, -16);
-        lv_obj_set_style_bg_color(s_toast, lv_color_hex(0x16161F), 0);
-        lv_obj_set_style_bg_opa(s_toast, LV_OPA_COVER, 0);
-        lv_obj_set_style_radius(s_toast, 8, 0);
-        lv_obj_set_style_border_opa(s_toast, LV_OPA_TRANSP, 0);
-        lv_obj_set_style_pad_all(s_toast, 8, 0);
-
-        s_toast_lbl = lv_label_create(s_toast);
-        lv_obj_set_width(s_toast_lbl, LCD_W - 60);
-        lv_label_set_long_mode(s_toast_lbl, LV_LABEL_LONG_WRAP);
-        lv_obj_set_style_text_font(s_toast_lbl, &lv_font_cn_16, 0);
-        lv_obj_set_style_text_color(s_toast_lbl, lv_color_hex(0xFF6B6B), 0);
-        lv_obj_set_style_text_align(s_toast_lbl, LV_TEXT_ALIGN_CENTER, 0);
-    }
-    lv_label_set_text(s_toast_lbl, text);
-    lv_obj_clear_flag(s_toast, LV_OBJ_FLAG_HIDDEN);
-    s_toast_until = esp_timer_get_time() + 4000000;
-}
-
-void media_periodic(void)
-{
-    /* toast 自动消失（不管当前在看图还是播视频都要处理） */
-    if (s_toast && s_toast_until != 0 && esp_timer_get_time() > s_toast_until) {
-        lv_obj_add_flag(s_toast, LV_OBJ_FLAG_HIDDEN);
-        s_toast_until = 0;
-    }
-
-    if (s_mode != MEDIA_VIDEO || s_paused) return;
-
-    int64_t now = esp_timer_get_time();
-    if (now < s_next_frame_us) return;
-    /* 落后超过 3 帧就丢帧，别越追越慢 */
-    if (now - s_next_frame_us > (int64_t)s_frame_us * 3) {
-        s_next_frame_us = now;
-    } else {
-        s_next_frame_us += s_frame_us;
-    }
-
-    size_t len = 0;
-    int64_t t0 = esp_timer_get_time();
-    bool got_frame = s_raw_mjpeg ? raw_next_frame(&len) : avi_next_frame(&len);
-    int64_t t1 = esp_timer_get_time();
-    if (!got_frame) {             /* 播完 */
-        media_stop();
-        return;
-    }
-    jpg_src_t src = { .mem = s_jpg_buf, .size = len, .pos = 0, .f = NULL };
-    if (!jpeg_blit_to(&src, g_framebuffer, LCD_W, LCD_H, 0, 0, LCD_W, LCD_H)) {   /* 坏帧：跳过 */
-        if (++s_fail_streak >= 10) {
-            ESP_LOGE(TAG, "连续 %d 帧解码失败，停止播放（文件可能损坏或不是 MJPEG）", s_fail_streak);
-            media_stop();
-            return;
-        }
-        ESP_LOGW(TAG, "第 %d 帧解码失败", s_frame_idx);
-        return;
-    }
-    int64_t t2 = esp_timer_get_time();
-    s_fail_streak = 0;
-
-    if (s_first_flush) {
-        s_first_flush = false;
-        /* 排空 LVGL 切屏残留事务：先清已完成计数，再等到连续 6ms 无完成（partial
-         * 间隔约 2ms），保证下面的全屏事务前面没有别的事务排队/在传 */
-        LCD_DrainFlushDone();
-        while (LCD_WaitFlushDone(6)) { }
-        ESP_LOGI(TAG, "首帧 %u 字节 %dx%d  读帧 %lldms 解码 %lldms",
-                 (unsigned)len, s_jpeg_w, s_jpeg_h,
-                 (long long)(t1 - t0) / 1000, (long long)(t2 - t1) / 1000);
-        if (s_jpeg_w > LCD_W || s_jpeg_h > LCD_H) {
-            ESP_LOGW(TAG, "视频分辨率 %dx%d 大于屏幕 %dx%d：软解缩放很慢，请用 "
-                          "\"ffmpeg -i in -vf scale=%d:%d -r 15 -c:v mjpeg -q:v 4 -an out.avi\" 重转",
-                     s_jpeg_w, s_jpeg_h, LCD_W, LCD_H, LCD_W, LCD_H);
-        }
-    }
-
-    LCD_Flush_All();
-    /* DMA 没发完前绝不能解码下一帧：解码直接写同一个 g_framebuffer，抢缓冲就是花屏。
-     * 播放期间没有 LVGL partial 事务（视频屏是静态的），这个完成信号就是本次全屏事务。 */
-    LCD_WaitFlushDone(200);
-
-    /* 耗时统计：每 30 帧一条，卡顿在「读 SD」还是「tjgpd 解码」一目了然 */
-    static int     stat_n = 0;
-    static int64_t stat_read_us = 0, stat_dec_us = 0;
-    static size_t  stat_bytes = 0;
-    stat_n++;
-    stat_read_us += t1 - t0;
-    stat_dec_us  += t2 - t1;
-    stat_bytes   += len;
-    if (stat_n >= 30) {
-        int64_t avg_read = stat_read_us / stat_n;   /* 微秒/帧 */
-        int64_t avg_dec  = stat_dec_us / stat_n;
-        ESP_LOGI(TAG, "近30帧平均: 读帧 %lldms 解码 %lldms 帧大小 %u 字节",
-                 (long long)((avg_read + 500) / 1000),
-                 (long long)((avg_dec + 500) / 1000),
-                 (unsigned)(stat_bytes / stat_n));
-        stat_n = 0; stat_read_us = 0; stat_dec_us = 0; stat_bytes = 0;
-    }
-}
 
 void media_stop(void)
 {
-    if (s_mode == MEDIA_VIDEO) {
-        avi_close();
-        s_paused = false;
-    }
     /* 退出时清掉 LVGL 的图片解码缓存：一张 320x240 的 PNG 解码后就占 307KB PSRAM */
     lv_image_cache_drop(NULL);
     s_mode = MEDIA_IDLE;

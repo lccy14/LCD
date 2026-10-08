@@ -47,7 +47,6 @@ typedef enum {
     FM_CMD_LIST,      /* 列出 s_cmd_path 目录 */
     FM_CMD_VIEW,      /* 预览 s_cmd_path 文本文件 */
     FM_CMD_IMAGE,     /* 用图片查看器打开 s_cmd_path */
-    FM_CMD_VIDEO,     /* 播放 s_cmd_path（MJPEG/AVI） */
     FM_CMD_DELETE     /* 删除 s_cmd_path */
 } fm_cmd_t;
 
@@ -477,15 +476,13 @@ static void row_click_cb(lv_event_t *e)
     elide_name(nm, disp, sizeof(disp), lv_obj_get_width(s_d_name) * 2);
     lv_label_set_text(s_d_name, disp);
 
-    /* 「打开」按钮：文本=预览，图片=看图，视频=播放，其它类型不支持 */
+    /* 「打开」按钮：文本=预览，图片=看图，其它类型不支持 */
     const char *open_txt = NULL;
     if (media_is_image(nm))      open_txt = "看图";
-    else if (media_is_video(nm)) open_txt = "播放";
     else if (is_text_file(nm))   open_txt = "打开";
 
     lv_label_set_text_fmt(s_d_info, "大小 %s\n%s", sz,
-                          open_txt ? (media_is_image(nm) ? "图片，可查看" :
-                                      media_is_video(nm) ? "MJPEG 视频，可播放" : "文本，可预览")
+                          open_txt ? (media_is_image(nm) ? "图片，可查看" : "文本，可预览")
                                    : "暂不支持预览");
     if (open_txt) {
         lv_label_set_text(s_d_open_lbl, open_txt);
@@ -512,11 +509,10 @@ static void detail_open_cb(lv_event_t *e)
     char full[FM_PATH_LEN];
     path_join(full, sizeof(full), s_cwd, s_entries[s_sel].name);
     snprintf(s_cmd_path, sizeof(s_cmd_path), "%s", full);
-    /* 按类型分发：文本→预览，图片→看图，视频→播放 */
+    /* 按类型分发：文本→预览，图片→看图 */
     if (media_is_image(s_entries[s_sel].name))      s_cmd = FM_CMD_IMAGE;
-    else if (media_is_video(s_entries[s_sel].name)) s_cmd = FM_CMD_VIDEO;
     else                                            s_cmd = FM_CMD_VIEW;
-}
+    }
 
 static void detail_del_cb(lv_event_t *e)
 {
@@ -764,12 +760,9 @@ bool file_mgr_media_neighbor(const char *cur, int dir, char *out, size_t out_n)
         return false;                      /* 不在当前目录里（例如从别处打开的） */
     }
 
-    /* 只找同类型的：图片↔图片，视频↔视频 */
-    bool want_img = media_is_image(s_entries[cur_idx].name);
+    /* 只找图片类型的下一张/上一张 */
     for (int i = cur_idx + dir; i >= 0 && i < s_cnt; i += dir) {
-        bool is_img = media_is_image(s_entries[i].name);
-        bool is_vid = media_is_video(s_entries[i].name);
-        if (want_img ? !is_img : !is_vid) {
+        if (!media_is_image(s_entries[i].name)) {
             continue;
         }
         char full[FM_PATH_LEN];
@@ -824,10 +817,6 @@ void file_mgr_periodic(void)
     case FM_CMD_IMAGE:
         lv_obj_add_flag(s_detail, LV_OBJ_FLAG_HIDDEN);   /* 进看图，详情页收起来 */
         media_image_open(s_cmd_path);
-        break;
-    case FM_CMD_VIDEO:
-        lv_obj_add_flag(s_detail, LV_OBJ_FLAG_HIDDEN);
-        media_video_play(s_cmd_path);
         break;
     case FM_CMD_DELETE:
         fm_delete(s_cmd_path);
