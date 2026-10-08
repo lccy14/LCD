@@ -252,8 +252,7 @@ static void snake_back_cb(lv_event_t *e) {
     if (g_food_obj) { lv_obj_del(g_food_obj); g_food_obj = NULL; }
     g_active = false;
     ui_set_status_bar_visible(true);   /* 退出游戏, 恢复系统状态栏 */
-    extern void ui_go_home(void);
-    ui_go_home();
+    ui_go_home();                      /* ui.h 已声明: 回主界面并做收缩动画 */
 }
 
 /* 游戏初始化 */
@@ -393,7 +392,7 @@ void snake_create_screen(void) {
     build_dpad();
 
     snake_init();
-    lv_screen_load(g_snake_screen);
+    ui_open_screen_anim(g_snake_screen, APP_GAME);   /* 带屏幕切换动画进入 */
     g_active = true;
     ESP_LOGI(TAG, "snake screen created");
 }

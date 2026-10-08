@@ -512,30 +512,128 @@ static void build_ble_screen(lv_obj_t *scr);
 static void go_home_cb(lv_event_t *e)
 {
     (void)e;
-    pc_mon_set_active(false);   /* 离开 App 界面，停止监控数据拉取 */
-    lv_screen_load(g_home);
+    ui_go_home();   /* 内部会停掉 pc_mon 拉取 + 做收缩动画 */
 }
 
-/* 供 pvz.c 返回按钮调用: 跳回主界面。 */
+/* ---------------- App 切换动画 ----------------
+ * 结论：本硬件上只能用「整块位移」，不能用「整屏改透明度」。
+ *
+ * 之前试过 LV_SCREEN_LOAD_ANIM_FADE_IN，实测进 App 时屏幕明显暗一档、结束时闪一下。
+ * 原因不是 LVGL 的 bug，是 PARTIAL 刷新模式的固有性质（lvgl_port.c:238 注册的是
+ * PARTIAL + 两个 40 行 draw buf）：
+ *   1. draw buf 里**从来不是整帧图像**，只有最近渲染过的若干行的像素，40 行缓冲区
+ *      被从头到尾循环复用，所以任意时刻 buf 里装的是各种历史残留像素。
+ *   2. 屏幕 opa<100% 时（lv_display.c 的 opa_scale_anim → lv_obj_set_style_opa），
+ *      LVGL 渲染新屏是往 draw buf 上做 **alpha 混合**，混合对象是 buf 里那些残留像素，
+ *      而不是"旧屏画面"（旧屏此时已经被标脏清除、且没有被重绘，见 lv_refr.c:1069-1078
+ *      虽然遍历了 prev_scr，但对象没 invalidate 就不会画）。
+ *      → 画面混合出一堆历史的暗像素 = 看着发暗、局部发花。
+ *   3. 动画一结束 scr_anim_completed 立刻 lv_obj_remove_local_style_prop(scr, OPA)
+ *      （lv_display.c:1535）把 opa 恢复成 255，残留像素的那份混色瞬间消失
+ *      → 亮度整屏跳变一下 = 那个"闪"。
+ *
+ * 所以：任何依赖屏幕半透明的动画（FADE_IN / FADE_OUT）在 PARTIAL 模式下都不成立。
+ * OVER_* 位移动画没有这个问题：新屏是**不透明**的，画到哪算哪，没盖住的区域不脏、
+ * 不刷新，LCD 自带 GRAM 保持原画面即可，既干净又省。
+ *
+ * 各种动画每帧的重绘量（一屏要切成 6 块渲染+DMA）：
+ *   MOVE_* : 新旧两屏同时位移，两个 anim 一起跑 → 12 块/帧（实测卡）
+ *   OVER_* : 只动新屏                            →  6 块/帧  ← 用它
+ *
+ * 最后一个参数 auto_del 一律 false —— App 屏幕是懒加载后复用的对象，
+ * 让 LVGL 自动删掉的话，下次打开这个 App 就没对象了。
+ *
+ * 如果你确实想要淡入淡出且不想发花，唯一干净的做法是「黑幕法」：
+ * 先 lv_screen_load(scr) 原样切过去，再在整屏铺一层**不透明黑矩形**，
+ * 把这个矩形的 opa 从 255 动到 0。黑幕和它下面的内容是同一个 tile 内先后绘制的，
+ * alpha 混合的下层是这一帧刚画好的新屏像素，而不是 buf 残留，所以不会脏。
+ * 代价同样是 6 块/帧（外加一层纯色 fill，很便宜）。把下面的
+ * UI_ANIM_USE_MASK_FADE 改 1 就能用，实现在其下方。
+ */
+
+#define APP_ANIM_MS  200   /* 切换动画时长：帧数少了，掉帧也不明显 */
+
+/* 0 = 方向滑动（当前在用，见上面分析）；1 = 黑幕淡入（实验） */
+#define UI_ANIM_USE_MASK_FADE  0
+
+#if UI_ANIM_USE_MASK_FADE
+static void ui_switch_mask(lv_obj_t *scr);   /* 实现在下面 */
+
+static lv_obj_t *s_fade_mask = NULL;   /* 正在播放的黑幕（同时只允许一个） */
+
+static void mask_opa_anim(void *obj, int32_t v)
+{
+    lv_obj_set_style_opa((lv_obj_t *)obj, v, 0);
+}
+
+static void mask_ready_cb(lv_anim_t *a)
+{
+    if (a->var == (void *)s_fade_mask) s_fade_mask = NULL;
+    lv_obj_delete((lv_obj_t *)a->var);
+}
+
+/* 「黑幕淡入」：不用 LV_SCREEN_LOAD_ANIM_FADE_*（那玩意儿在 PARTIAL 模式下会把
+ * draw buf 里的残留像素混进来，画面发暗发花，见上面分析）。
+ * 这里改成：先原样切屏，再盖一层不透明黑矩形，矩形 opa 255→0。
+ * 黑幕和新屏内容在同一个 tile 内先后绘制，混合的下层是这一帧刚画好的新屏像素，
+ * 不是 buf 残留 → 干净。开销同样是 6 块/帧，只多一层纯色 fill。 */
+static void ui_switch_mask(lv_obj_t *scr)
+{
+    /* 上一次的黑幕还没播完就又切屏：直接删掉旧的，避免多个黑幕叠着变不透明 */
+    if (s_fade_mask) {
+        lv_anim_delete(s_fade_mask, NULL);
+        lv_obj_delete(s_fade_mask);
+        s_fade_mask = NULL;
+    }
+
+    lv_screen_load(scr);            /* 不带动画, 立刻生效 */
+
+    lv_display_t *d = lv_display_get_default();
+    lv_obj_t *m = lv_obj_create(lv_layer_top());
+    lv_obj_remove_style_all(m);
+    lv_obj_remove_flag(m, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_pos(m, 0, 0);
+    lv_obj_set_size(m, lv_display_get_horizontal_resolution(d),
+                       lv_display_get_vertical_resolution(d));
+    lv_obj_set_style_bg_color(m, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(m, LV_OPA_COVER, 0);
+    lv_obj_set_style_opa(m, LV_OPA_COVER, 0);
+    s_fade_mask = m;
+
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, m);
+    lv_anim_set_exec_cb(&a, mask_opa_anim);
+    lv_anim_set_values(&a, LV_OPA_COVER, LV_OPA_TRANSP);
+    lv_anim_set_duration(&a, APP_ANIM_MS);
+    lv_anim_set_completed_cb(&a, mask_ready_cb);
+    lv_anim_start(&a);
+}
+#endif
+
+static void ui_switch(lv_obj_t *scr, bool back)
+{
+#if UI_ANIM_USE_MASK_FADE
+    ui_switch_mask(scr);
+#else
+    lv_screen_load_anim(scr,
+                        back ? LV_SCREEN_LOAD_ANIM_OVER_RIGHT : LV_SCREEN_LOAD_ANIM_OVER_LEFT,
+                        APP_ANIM_MS, 0, false);
+#endif
+}
+
+void ui_open_screen_anim(lv_obj_t *scr, app_id_t id)
+{
+    (void)id;
+    if (!scr) return;
+    ui_switch(scr, false);      /* 进 App：新屏从右边压进来 */
+}
+
+/* 供 pvz.c 等外部界面调用: 跳回主界面（往回退，方向相反） */
 void ui_go_home(void) {
-    pc_mon_set_active(false);
-    lv_screen_load(g_home);
+    pc_mon_set_active(false);   /* 离开 App 界面，停止监控数据拉取 */
+    ui_switch(g_home, true);    /* 回主页：主页从左边推回来 */
 }
-
-/* App 编号，用于懒加载各屏幕 */
-typedef enum {
-    APP_WIFI = 1,
-    APP_SETTINGS,
-    APP_CLOCK,
-    APP_MUSIC,
-    APP_GAME,
-    APP_WEATHER,
-    APP_NOVEL,
-    APP_PCMON,
-    APP_ALARM,
-    APP_BLE,
-    APP_FILES
-} app_id_t;
 
 /* 打开某个 App 屏幕：仅记录待跳转 id，真正的建屏/加载放到主循环里执行。
  * 不能在这里同步建屏——此回调运行在 lv_timer_handler 的输入事件里，
@@ -1928,22 +2026,21 @@ static void game_mbox_2048_cb(lv_event_t *e)
     (void)e;
     game_mbox_close();
     if (!g_game_screen) { g_game_screen = make_app_screen("游戏2048"); build_game_screen(g_game_screen); }
-    lv_screen_load(g_game_screen);
+    ui_open_screen_anim(g_game_screen, APP_GAME);
 }
 
 static void game_mbox_snake_cb(lv_event_t *e)
 {
     (void)e;
     game_mbox_close();
-    snake_create_screen();   /* 内部已 lv_screen_load */
+    snake_create_screen();   /* 内部已 ui_open_screen_anim 切屏 */
 }
 
 static void game_mbox_cancel_cb(lv_event_t *e)
 {
     (void)e;
     game_mbox_close();
-    extern void ui_go_home(void);
-    ui_go_home();
+    ui_go_home();        /* ui.h 已声明 */
 }
 
 static void show_game_chooser(void)
@@ -2748,7 +2845,7 @@ static void ui_handle_pending_app(void)
         if (id == APP_FILES) {
             file_mgr_on_open();   /* 请求挂载 SD 卡并列出根目录（真正干活在主循环） */
         }
-        lv_screen_load(scr);
+        ui_open_screen_anim(scr, (app_id_t)id);   /* 带切换动画 */
         /* 只有停留在监控界面时才让 pc_mon 联网拉数据，其余界面一律停止 */
         pc_mon_set_active(scr == g_pcmon_screen);
     }
