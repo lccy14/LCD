@@ -28,14 +28,12 @@
 #define SNK_ROWS          13        /* (240-32)/16 = 13 */
 #define SNK_MAX_LEN       (SNK_COLS * SNK_ROWS)
 
-/* 右侧方向键区: 紧凑十字布局（上下键宽、左右键窄，x: 240~319） */
-#define SNK_PAD_X0        (SNK_COLS * SNK_CELL_W)   /* 240 = 游戏区右边界 */
-#define SNK_BTN_H         48
+/* 右侧方向键区: 4 个等大方块, 十字排布 (x: 244~320, 区域宽 76) */
+#define SNK_BTN_S         36        /* 4 个键统一边长 */
 #define SNK_BTN_GAP       4
-#define SNK_BTN_W         72        /* 上下键宽 */
-#define SNK_BTN_SW        34        /* 左右键宽 */
+#define SNK_PAD_X0        (SNK_COLS * SNK_CELL_W)   /* 240 = 游戏区右边界 */
 #define SNK_PAD_X         (SNK_PAD_X0 + 4)                    /* 244 */
-#define SNK_PAD_TOP       (SNK_GRID_Y0 + 28)                  /* 60: 竖直居中 */
+#define SNK_PAD_TOP       (SNK_GRID_Y0 + 26)                  /* 58: 竖直居中 */
 
 #define SPRITE_W          SNAKE_SPRITE_PX   /* 16 */
 #define SPRITE_H          SNAKE_SPRITE_PX
@@ -46,6 +44,15 @@
 #define SP_HEAD_DOWN      2
 #define SP_HEAD_LEFT      3
 #define SP_BODY_HZ        4
+#define SP_BODY_VT        5
+#define SP_TURN_TL        6
+#define SP_TURN_TR        7
+#define SP_TURN_BL        8
+#define SP_TURN_BR        9
+#define SP_TAIL_UP        10
+#define SP_TAIL_RIGHT     11
+#define SP_TAIL_DOWN      12
+#define SP_TAIL_LEFT      13
 #define SP_FOOD           14
 
 /* 4 个方向的蛇头 sprite (引用 snake_sprite_data 中的常量数据) */
@@ -60,7 +67,16 @@ static lv_image_dsc_t head_sprites[4] = {
     HEAD_DSC(SP_HEAD_UP), HEAD_DSC(SP_HEAD_RIGHT),
     HEAD_DSC(SP_HEAD_DOWN), HEAD_DSC(SP_HEAD_LEFT),
 };
-static lv_image_dsc_t body_sprite = HEAD_DSC(SP_BODY_HZ);
+static lv_image_dsc_t body_sprite    = HEAD_DSC(SP_BODY_HZ);
+static lv_image_dsc_t body_vt_sprite = HEAD_DSC(SP_BODY_VT);
+static lv_image_dsc_t tail_sprites[4] = {
+    HEAD_DSC(SP_TAIL_UP), HEAD_DSC(SP_TAIL_RIGHT),
+    HEAD_DSC(SP_TAIL_DOWN), HEAD_DSC(SP_TAIL_LEFT),
+};
+static lv_image_dsc_t turn_sprites[4] = {
+    HEAD_DSC(SP_TURN_TL), HEAD_DSC(SP_TURN_TR),
+    HEAD_DSC(SP_TURN_BL), HEAD_DSC(SP_TURN_BR),
+};
 static lv_image_dsc_t food_sprite = HEAD_DSC(SP_FOOD);
 
 /* 游戏状态 ------------------------------------------------------------- */
@@ -117,15 +133,50 @@ static int head_sprite_idx(snake_dir_t d) {
     return SP_HEAD_RIGHT;
 }
 
+/* 尾巴朝向: 尾尖朝外 (从倒数第二节指向尾节的方向) */
+static int snake_tail_idx(snake_pt_t prev, snake_pt_t cur) {
+    if (cur.x > prev.x) return SP_TAIL_RIGHT;
+    if (cur.x < prev.x) return SP_TAIL_LEFT;
+    if (cur.y > prev.y) return SP_TAIL_DOWN;
+    return SP_TAIL_UP;
+}
+
+/* 转弯朝向: 由「进入方向 + 离开方向」决定连接的两个轴 */
+static int snake_turn_idx(int dxp, int dyp, int dxn, int dyn) {
+    bool up    = (dyp == -1) || (dyn == -1);
+    bool down  = (dyp ==  1) || (dyn ==  1);
+    bool left  = (dxp == -1) || (dxn == -1);
+    bool right = (dxp ==  1) || (dxn ==  1);
+    if (up   && left)  return SP_TURN_TL;
+    if (up   && right) return SP_TURN_TR;
+    if (down && left)  return SP_TURN_BL;
+    if (down && right) return SP_TURN_BR;
+    return SP_BODY_HZ;
+}
+
 static void draw_snake(void) {
-    /* 重建所有蛇身 obj (简单粗暴, 蛇不长, 性能可接受) */
     const lv_image_dsc_t *head = &head_sprites[head_sprite_idx(g_dir)];
     for (int i = 0; i < g_snake_len; i++) {
         if (!g_body_objs[i]) {
             g_body_objs[i] = lv_image_create(g_snake_screen);
             lv_obj_clear_flag(g_body_objs[i], LV_OBJ_FLAG_SCROLLABLE);
         }
-        lv_image_set_src(g_body_objs[i], (i == 0) ? head : &body_sprite);
+        const lv_image_dsc_t *src;
+        if (i == 0) {
+            src = head;                       /* 蛇头: 4 方向 */
+        } else if (i == g_snake_len - 1) {
+            int idx = snake_tail_idx(g_snake[g_snake_len - 2],
+                                     g_snake[g_snake_len - 1]) - SP_TAIL_UP;
+            src = &tail_sprites[idx];         /* 蛇尾: 随朝向变, 不再固定 */
+        } else {
+            snake_pt_t prev = g_snake[i - 1], cur = g_snake[i], next = g_snake[i + 1];
+            int dxp = cur.x - prev.x, dyp = cur.y - prev.y;
+            int dxn = next.x - cur.x, dyn = next.y - cur.y;
+            if (dyp == 0 && dyn == 0)      src = &body_sprite;       /* 水平直线 */
+            else if (dxp == 0 && dxn == 0) src = &body_vt_sprite;    /* 垂直直线 */
+            else                           src = &turn_sprites[snake_turn_idx(dxp, dyp, dxn, dyn) - SP_TURN_TL];
+        }
+        lv_image_set_src(g_body_objs[i], src);
         lv_obj_set_pos(g_body_objs[i], cell_x(g_snake[i].x), cell_y(g_snake[i].y));
     }
     /* 多余的 obj (蛇变短时) 删除 */
@@ -230,17 +281,19 @@ static void dpad_key(int x, int y, int w, int h, const char *sym, snake_dir_t d)
     lv_obj_add_event_cb(b, dpad_cb, LV_EVENT_PRESSED, (void *)(uintptr_t)d);
 }
 
-/* 右侧方向键, 十字排布: 上下两个长条 + 中间一对左右键 */
+/* 右侧方向键: 4 个等大方块, 十字排布 (上 / 中行左+右 / 下) */
 static void build_dpad(void)
 {
-    const int y_lr   = SNK_PAD_TOP + (SNK_BTN_H + SNK_BTN_GAP);
-    const int y_down = SNK_PAD_TOP + (SNK_BTN_H + SNK_BTN_GAP) * 2;
-    const int x_r    = SNK_PAD_X + SNK_BTN_SW + SNK_BTN_GAP;
+    const int s     = SNK_BTN_S;
+    const int gap   = SNK_BTN_GAP;
+    const int cx    = SNK_PAD_X + s + gap / 2;     /* 区域中心=282, 上下键真正居中 */
+    const int mid_y = SNK_PAD_TOP + s + gap;       /* 中间行 (左/右) y */
+    const int down_y = mid_y + s + gap;            /* 下键 y */
 
-    dpad_key(SNK_PAD_X, SNK_PAD_TOP, SNK_BTN_W,  SNK_BTN_H, LV_SYMBOL_UP,    DIR_UP);
-    dpad_key(SNK_PAD_X, y_lr,        SNK_BTN_SW, SNK_BTN_H, LV_SYMBOL_LEFT,  DIR_LEFT);
-    dpad_key(x_r,       y_lr,        SNK_BTN_SW, SNK_BTN_H, LV_SYMBOL_RIGHT, DIR_RIGHT);
-    dpad_key(SNK_PAD_X, y_down,      SNK_BTN_W,  SNK_BTN_H, LV_SYMBOL_DOWN,  DIR_DOWN);
+    dpad_key(cx - s / 2, SNK_PAD_TOP, s, s, LV_SYMBOL_UP,    DIR_UP);
+    dpad_key(SNK_PAD_X,  mid_y,       s, s, LV_SYMBOL_LEFT,  DIR_LEFT);
+    dpad_key(SNK_PAD_X + s + gap, mid_y, s, s, LV_SYMBOL_RIGHT, DIR_RIGHT);
+    dpad_key(cx - s / 2, down_y,      s, s, LV_SYMBOL_DOWN,  DIR_DOWN);
 }
 
 static void snake_back_cb(lv_event_t *e) {

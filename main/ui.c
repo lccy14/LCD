@@ -24,6 +24,7 @@
 #include "snake.h"            /* 贪吃蛇 */
 #include "novel_text.h"
 #include "file_mgr.h"         /* 文件管理（SD 卡 / SDMMC + FATFS） */
+#include "sd_card.h"          /* SD_MOUNT_POINT / sd_card_mount / sd_card_is_mounted，小说扫 SD 卡电子书 */
 #include "media.h"            /* 图片查看（JPG/PNG/BMP） */
 #include <dirent.h>           /* 音乐：扫描 SD 卡音频文件（opendir/readdir） */
 #include <strings.h>          /* strcasecmp，音乐扩展名判断 */
@@ -244,6 +245,7 @@ static bool     s_wx_fetching     = false;      /* 上次界面显示的“请�
 static uint32_t s_last_wx_req_ms  = 0;          /* 上次发天气请求的 tick(ms) */
 static bool     s_wx_need_redraw  = false;      /* 进入天气屏时置位，强制重绘一次 */
 static uint8_t  s_prev_wifi_state = WIFI_STA_IDLE;
+static wifi_sta_state_t s_wx_wifi_state = WIFI_STA_CONNECTED;   /* 故意取非 IDLE, 首帧刷新即能暴露“WiFi 未连接”而非停在 -- */
 
 /* WiFi 列表固定行池：只在初始化时创建一次，扫描结果出来后原地更新，
  * 不在主循环里反复 lv_obj_create，避免对象爆炸导致看门狗复位 */
@@ -1559,6 +1561,11 @@ static void ui_alarm_update_label(void)
     lv_label_set_text(g_alarm_label, buf);
 }
 
+/* 3 个闹钟行的 row 指针：build 时登记，回调按 idx 直接取。
+ * 不用 lv_obj_get_child(screen, N) 按索引定位——make_app_screen 只建 1 个
+ * 子对象(标题栏)，状态栏在独立 lv_layer_top 层，按索引会整体错位。 */
+static lv_obj_t *s_alarm_rows[ALARM_MAX];
+
 /* 闹钟屏按钮编号（user_data 编码：idx*10 + op） */
 enum {
     ALARM_OP_HOUR_DEC = 0,
@@ -1591,7 +1598,7 @@ static void alarm_btn_cb(lv_event_t *e)
 
     /* 同步刷新闹钟屏里对应行的显示 */
     if (g_alarm_screen) {
-        lv_obj_t *row = lv_obj_get_child(g_alarm_screen, 2 + idx);   /* 跳过状态栏+标题栏 */
+        lv_obj_t *row = (idx >= 0 && idx < ALARM_MAX) ? s_alarm_rows[idx] : NULL;
         if (row) {
             lv_obj_t *tm = lv_obj_get_child(row, 1);     /* 时间 label */
             lv_obj_t *sw = lv_obj_get_child(row, 6);     /* 开关按钮 */
@@ -1659,6 +1666,7 @@ static void build_alarm_screen(lv_obj_t *scr)
     for (int i = 0; i < ALARM_MAX; i++) {
         const alarm_conf_t *a = alarm_get(i);
         lv_obj_t *row = lv_obj_create(scr);
+        s_alarm_rows[i] = row;   /* 登记，供 alarm_btn_cb 按 idx 直接定位 */
         lv_obj_set_size(row, LCD_W - 16, row_h);
         lv_obj_align(row, LV_ALIGN_TOP_MID, 0, y0 + i * (row_h + 6));
         lv_obj_set_style_bg_color(row, lv_color_hex(0x16161F), 0);
@@ -2507,7 +2515,8 @@ static void build_game_screen(lv_obj_t *scr)
  * 拷进栈上缓冲再交给 LVGL（LVGL 会自行复制一份），因此内存开销极小。
  * 小说屏有两层：书单（列表）-> 点书名进入阅读器（正文 + 翻页）。
  * -------------------------------------------- */
-#define NOVEL_PAGE_CHARS   84      /* 每页字符数（按"字"算，不是字节） */
+#define NOVEL_LINES_PER_PAGE  13    /* 每页渲染行数 */
+#define NOVEL_LINE_CHARS      13    /* 每行中文字数 */
 
 static lv_obj_t *g_novel_screen  = NULL;
 static lv_obj_t *g_novel_list    = NULL;   /* 书单容器 */
@@ -2520,6 +2529,37 @@ static int       g_cur_book  = 0;
 static int       g_cur_page  = 0;
 static int       g_cur_pages = 0;
 
+/* 小说：扫描 SD 卡固定文件夹 NOVEL_DIR 下的 .txt/.md 作书单；
+ * 内置 g_novel_books[]（Flash）始终在书单最前。 */
+#define NOVEL_DIR        SD_MOUNT_POINT "/novels"   /* 内存卡里放电子书的文件夹 */
+#define NOVEL_SD_MAX     32
+#define NOVEL_PATH_LEN   300
+typedef struct {
+    char  title[128];
+    char  path[NOVEL_PATH_LEN];
+    FILE *fp;              /* 当前打开的流（阅读时）；NULL=未打开 */
+    long *page_off;        /* 每页起始字节偏移，长度 pages+1（阅读前构建） */
+    int   pages;           /* 总页数 */
+    int   fbytes;          /* 文件字节数（日志用） */
+} novel_sd_book_t;
+
+static novel_sd_book_t g_sd_books[NOVEL_SD_MAX];
+static int             g_sd_count = 0;
+
+/* 当前阅读的书（统一访问层）：Flash 书用 flash_text，SD 书用 fp+page_off 流式读 */
+static struct {
+    bool        is_sd;
+    int         sd_idx;     /* SD 书在 g_sd_books 的索引（关闭 fp 用） */
+    const char *flash_text; /* Flash 书正文 */
+    FILE       *fp;         /* SD 书流 */
+    long       *page_off;   /* SD 书页偏移表 */
+    int         pages;      /* 总页数 */
+} g_cur = {0};
+
+/* 书单行池：内置书 + SD 书上限，进入时由 novel_refresh_list 填充 */
+static lv_obj_t *g_novel_rows[NOVEL_BOOK_COUNT + NOVEL_SD_MAX];
+static lv_obj_t *g_novel_row_name[NOVEL_BOOK_COUNT + NOVEL_SD_MAX];
+
 /* UTF-8：把 pos 移到下一个字符起始，避免按字节截断汉字 */
 static size_t novel_utf8_next(const char *s, size_t pos)
 {
@@ -2527,45 +2567,357 @@ static size_t novel_utf8_next(const char *s, size_t pos)
     return pos;
 }
 
-/* 从第 pos 个字节起，前进 n 个字符 */
-static size_t novel_skip_chars(const char *s, size_t pos, int n)
+/* 从第 pos 个字节起，前进 n 个「渲染行」（硬换行 \n 算一行，满 NOVEL_LINE_CHARS 字自动折行算一行）。
+ * 返回新字节位置。用于按「屏幕行」分页，避免换行多的文本被固定字符数分页裁掉/跳过。 */
+static size_t novel_skip_lines(const char *s, size_t pos, int n_lines)
 {
-    for (int i = 0; i < n && s[pos] != '\0'; i++) {
-        pos = novel_utf8_next(s, pos + 1);
+    int line = 1, col = 0;
+    size_t i = pos;
+    while (s[i] != '\0') {
+        unsigned char c = (unsigned char)s[i];
+        if (c == '\r') { i++; continue; }
+        if (c == '\n') {
+            line++; col = 0;
+            if (line > n_lines) return i + 1;   /* 下一行起点（\n 之后） */
+            i++; continue;
+        }
+        if ((c & 0xC0u) != 0x80u) {              /* 新字符起始 */
+            col++;
+            if (col > NOVEL_LINE_CHARS) {        /* 软换行（自动折行） */
+                line++; col = 1;
+                if (line > n_lines) return i;    /* 当前字是新行首 */
+            }
+        }
+        i = novel_utf8_next(s, i + 1);
     }
-    return pos;
+    return i;
 }
 
 static int novel_page_count(const char *text)
 {
-    int chars = 0;
-    for (size_t i = 0; text[i] != '\0'; i = novel_utf8_next(text, i + 1)) {
-        chars++;
+    int pages = 0;
+    size_t pos = 0;
+    while (text[pos] != '\0') {
+        pos = novel_skip_lines(text, pos, NOVEL_LINES_PER_PAGE);
+        pages++;
     }
-    return (chars + NOVEL_PAGE_CHARS - 1) / NOVEL_PAGE_CHARS;
+    return pages;
+}
+
+/* 打开 SD 书并构建「页偏移表」（按渲染行分页，记录每页起始字节）。
+ * 只遍历一次文件统计字符边界，不把整本载入内存；之后显示时按页 fseek+fread。
+ * 返回 true 表示可用（fp 保持打开，page_off 常驻）。 */
+static bool novel_sd_open(int j)
+{
+    novel_sd_book_t *b = &g_sd_books[j];
+    const char *path = b->path;
+    if (b->page_off) {                         /* 已构建过，恢复流即可 */
+        if (!b->fp) b->fp = fopen(path, "rb");
+        return b->fp != NULL;
+    }
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (fsize <= 0) { fclose(f); return false; }
+    b->fbytes = (int)fsize;
+
+    int maxp = (int)(fsize / (NOVEL_LINE_CHARS * NOVEL_LINES_PER_PAGE * 2)) + 16;  /* 页数上限（保守估算，留余量） */
+    long *off = (long *)heap_caps_malloc(sizeof(long) * (size_t)(maxp + 1), MALLOC_CAP_SPIRAM);
+    if (!off) off = (long *)heap_caps_malloc(sizeof(long) * (size_t)(maxp + 1), MALLOC_CAP_DEFAULT);
+    if (!off) { fclose(f); return false; }
+
+    int  pages = 0;
+    off[0] = 0;
+    long pos = 0;          /* 当前字节偏移（下一字节待读位置） */
+    int  line = 1, col = 0;/* 按「渲染行」分页：硬换行 + 满 NOVEL_LINE_CHARS 字软换行 */
+    char tmp[4096];
+    size_t got;
+    int   recover = 0;     /* SD 读失败时重挂 SD 卡并续读的次数 */
+    while (1) {
+        got = fread(tmp, 1, sizeof(tmp), f);
+        if (got == 0) {
+            if (feof(f)) break;
+            if (recover++ < 3) {                     /* 卡掉线：重挂 SD + 重开文件，从 pos 续读 */
+                ESP_LOGW("NOVEL", "read error, remount SD (try %d)", recover);
+                fclose(f);
+                sd_card_unmount();
+                sd_card_mount(true);
+                f = fopen(path, "rb");
+                if (!f) { heap_caps_free(off); return false; }
+                fseek(f, pos, SEEK_SET);
+                continue;
+            }
+            ESP_LOGW("NOVEL", "read error while indexing '%s', abort", b->title);
+            heap_caps_free(off); fclose(f); return false;
+        }
+        recover = 0;
+        for (size_t k = 0; k < got; k++) {
+            unsigned char c = (unsigned char)tmp[k];
+            if (c == '\r') { pos++; continue; }          /* \r 不占行 */
+            if (c == '\n') {                             /* 硬换行：新行 */
+                line++; col = 0; pos++;
+                if (line > NOVEL_LINES_PER_PAGE) { pages++; off[pages] = pos; line = 1; }
+                continue;
+            }
+            if ((c & 0xC0u) != 0x80u) {                  /* 新字符起始 */
+                col++;
+                if (col > NOVEL_LINE_CHARS) {            /* 软换行（自动折行） */
+                    line++; col = 1;
+                    if (line > NOVEL_LINES_PER_PAGE) { pages++; off[pages] = pos; line = 1; }
+                }
+            }
+            pos++;
+        }
+    }
+    if (pages == 0 || pos > off[pages]) { pages++; off[pages] = pos; }   /* 末页边界 */
+
+    b->pages    = pages;
+    b->page_off = off;
+    b->fp       = f;                                     /* 保持打开，阅读时复用 */
+    ESP_LOGI("NOVEL", "open '%s' %d bytes, %d pages", b->title, b->fbytes, pages);
+    return true;
+}
+
+/* 扫描 SD 卡小说文件夹 NOVEL_DIR 下的 .txt/.md，填入 g_sd_books */
+static void novel_scan_sd(void)
+{
+    g_sd_count = 0;
+    if (!sd_card_is_mounted()) {
+        ESP_LOGI("NOVEL", "SD not mounted, try mount...");
+        (void)sd_card_mount(true);
+    }
+    ESP_LOGI("NOVEL", "scan %s, mounted=%d", NOVEL_DIR, sd_card_is_mounted());
+    DIR *d = opendir(NOVEL_DIR);
+    if (!d) {
+        ESP_LOGW("NOVEL", "opendir failed: %s missing or SD not mounted", NOVEL_DIR);
+        return;
+    }
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (g_sd_count >= NOVEL_SD_MAX) break;
+        const char *nm = e->d_name;
+        size_t L = strlen(nm);
+        if (L < 4) continue;
+        bool is_txt = (L >= 5 && strcasecmp(nm + L - 4, ".txt") == 0);
+        bool is_md  = (L >= 4 && strcasecmp(nm + L - 3, ".md") == 0);
+        if (!is_txt && !is_md) continue;
+        novel_sd_book_t *b = &g_sd_books[g_sd_count];
+        size_t ext = is_txt ? 4 : 3;
+        size_t tl = L - ext;
+        if (tl >= sizeof(b->title)) tl = sizeof(b->title) - 1;
+        memcpy(b->title, nm, tl);
+        b->title[tl] = '\0';
+        snprintf(b->path, sizeof(b->path), "%s/%s", NOVEL_DIR, nm);
+        b->fp = NULL; b->page_off = NULL; b->pages = 0;
+        ESP_LOGI("NOVEL", "  + %s", b->title);
+        g_sd_count++;
+    }
+    closedir(d);
+    ESP_LOGI("NOVEL", "total %d book(s)", g_sd_count);
+}
+
+/* 进入小说界面时刷新书单（每次都扫，处理 SD 卡刚挂载 / 新增书） */
+static void novel_refresh_list(void)
+{
+    if (!g_novel_list) return;
+    novel_scan_sd();
+    int total = NOVEL_BOOK_COUNT + g_sd_count;
+    int pool  = NOVEL_BOOK_COUNT + NOVEL_SD_MAX;
+    for (int i = 0; i < pool; i++) {
+        lv_obj_t *row = g_novel_rows[i];
+        if (!row) continue;
+        if (i < total) {
+            const char *t = (i < NOVEL_BOOK_COUNT) ? g_novel_books[i].title
+                                                  : g_sd_books[i - NOVEL_BOOK_COUNT].title;
+            lv_label_set_text(g_novel_row_name[i], t);
+            lv_obj_set_user_data(row, (void *)(intptr_t)i);
+            lv_obj_clear_flag(row, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(row, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    lv_obj_scroll_to_y(g_novel_list, 0, LV_ANIM_OFF);
+}
+
+/* 精确分页：用 LVGL 真实排版行数，从当前位置动态累积文本到铺满一屏再停。
+ * 换行多会自动借后续内容铺满；密文本超屏会回退到上一个换行处，绝不裁切/吞字。 */
+#define NOVEL_LINE_W       208   /* 每行宽度阈值(px)：216宽/16px中文，每行≤13字，确定性分页用 */
+static char   s_rd_buf[2048];
+static char   s_rd_disp[2048];  /* 显示文本（压缩空行后） */
+static long   s_rd_posmap[2048];
+static long   g_rd_pos  = 0;    /* 当前页首：SD=字节偏移，Flash=字符索引 */
+static long   g_rd_end  = 0;    /* 当前页末（下一页首） */
+static long   g_hist[64];       /* 翻页历史（支持左滑上一页） */
+static int    g_hist_n  = 0;
+
+/* 从 pos 取一段文本写入 buf（去 \r），返回写入长度；pos 更新为读取后的原始位置。
+ * posmap[i] = buf[i] 对应的原始偏移，用于回退到换行处时定位页末。 */
+static size_t novel_fetch_sd(char *buf, size_t cap, long *pos, long *posmap)
+{
+    if (!g_cur.fp) return 0;
+    fseek(g_cur.fp, *pos, SEEK_SET);
+    size_t w = 0;
+    char tmp[256];
+    while (w < cap) {
+        size_t to = (cap - w < 256) ? (cap - w) : 256;
+        size_t rd = fread(tmp, 1, to, g_cur.fp);
+        if (rd == 0) {
+            if (feof(g_cur.fp)) break;
+            fclose(g_cur.fp); g_cur.fp = NULL;          /* SD 偶发错：重挂续读 */
+            sd_card_unmount(); sd_card_mount(true);
+            FILE *nf = fopen(g_sd_books[g_cur.sd_idx].path, "rb");
+            if (!nf) break;
+            g_cur.fp = nf; g_sd_books[g_cur.sd_idx].fp = nf;
+            fseek(nf, *pos, SEEK_SET);
+            continue;
+        }
+        long base = *pos;
+        for (size_t i = 0; i < rd && w < cap; i++) {
+            if (tmp[i] == '\r') continue;
+            buf[w] = tmp[i]; posmap[w] = base + (long)i; w++;
+        }
+        *pos += (long)rd;
+    }
+    return w;
+}
+
+static size_t novel_fetch_flash(const char *text, char *buf, size_t cap, long *pos, long *posmap)
+{
+    size_t w = 0; size_t i = (size_t)(*pos);
+    while (w < cap && text[i] != '\0') {
+        buf[w] = text[i]; posmap[w] = (long)i; w++; i++;
+    }
+    *pos = (long)i;
+    return w;
+}
+
+/* 字体子集大概率缺这些标点，渲染前换成字体里有的近似字符，避免显示成占位符(tofu) */
+static uint32_t novel_fix_cp(uint32_t cp)
+{
+    switch (cp) {
+        case 0x201C: case 0x201D: return '"';   /* “ ” 弯双引号 */
+        case 0x2018: case 0x2019: return '\'';  /* ‘ ’ 弯单引号 */
+        case 0x2014: case 0x2013: return '-';   /* — – 破折号/连字符 */
+        case 0xFF5E: return '~';                /* ～ 全角波浪号 */
+        default: return cp;
+    }
+}
+
+/* 用真实字体测量：每行高 = 字体 line_height + 行距(2)，可用高度来自阅读器尺寸。
+ * 这样每页行数随真实字号自适应，物理屏能显示几行就分几行，绝不被裁。 */
+static int novel_lines_per_page(void)
+{
+    if (!g_novel_reader || !g_novel_label) return 13;
+    int lh    = (int)lv_font_cn_16.line_height + 2;          /* 行距与创建时 line_space=2 一致 */
+    int avail = lv_obj_get_height(g_novel_reader) - 8 - 28;  /* 顶偏移8 + 底页码区留白 */
+    int n = avail / lh;
+    return (n < 1) ? 1 : n;
 }
 
 static void novel_show_page(int page)
 {
+    (void)page;   /* 实际基于 g_rd_pos 流式翻页 */
     if (!g_novel_label) return;
-    const char *text = g_novel_books[g_cur_book].text;
-    if (g_cur_pages <= 0) g_cur_pages = novel_page_count(text);
-    if (page < 0) page = 0;
-    if (page > g_cur_pages - 1) page = g_cur_pages - 1;
-    g_cur_page = page;
+    if (g_cur_pages <= 0) g_cur_pages = g_cur.pages;
 
-    size_t start = novel_skip_chars(text, 0, page * NOVEL_PAGE_CHARS);
-    size_t end   = novel_skip_chars(text, start, NOVEL_PAGE_CHARS);
+    int lines_per_page = novel_lines_per_page();
+    int label_w = lv_obj_get_width(g_novel_label);
+    if (label_w < 1) label_w = LCD_W - 24;
 
-    size_t n = end - start;
-    char buf[NOVEL_PAGE_CHARS * 4];
-    if (n >= sizeof(buf)) n = sizeof(buf) - 1;
-    memcpy(buf, text + start, n);
-    buf[n] = '\0';
+    /* 1) 读一段原始文本（去 \r）到 s_rd_buf，posmap 记录每个字符的原始偏移 */
+    long pos = g_rd_pos;
+    size_t got = g_cur.is_sd
+        ? novel_fetch_sd(s_rd_buf, sizeof(s_rd_buf) - 1, &pos, s_rd_posmap)
+        : novel_fetch_flash(g_cur.flash_text, s_rd_buf, sizeof(s_rd_buf) - 1, &pos, s_rd_posmap);
+    s_rd_buf[got] = '\0';
 
-    lv_label_set_text(g_novel_label, buf);
+    /* 2) 按真实字形宽度累计 lines_per_page 行（压缩连续空行），找本页结束位置 */
+    size_t end = got;
+    int line = 0, wsum = 0, prev_nl = 0;
+    size_t i = 0;
+    while (i < got) {
+        unsigned char c0 = (unsigned char)s_rd_buf[i];
+        if (c0 == '\n') {
+            if (prev_nl) { i++; continue; }          /* 压缩连续空行 */
+            line++; wsum = 0; prev_nl = 1; i++;
+            if (line >= lines_per_page) { end = i; break; }   /* 含此 \n */
+            continue;
+        }
+        prev_nl = 0;
+        /* UTF-8 解码 + 真实字形宽度（与 LVGL LONG_WRAP 一致，杜绝超屏/吞字/跳页） */
+        uint32_t cp = c0; int clen = 1;
+        if (c0 >= 0x80) {
+            if ((c0 & 0xE0) == 0xC0)      { cp = ((c0 & 0x1F) << 6)  | (s_rd_buf[i+1] & 0x3F); clen = 2; }
+            else if ((c0 & 0xF0) == 0xE0) { cp = ((c0 & 0x0F) << 12) | ((s_rd_buf[i+1] & 0x3F) << 6)  | (s_rd_buf[i+2] & 0x3F); clen = 3; }
+            else if ((c0 & 0xF8) == 0xF0) { cp = ((c0 & 0x07) << 18) | ((s_rd_buf[i+1] & 0x3F) << 12) | ((s_rd_buf[i+2] & 0x3F) << 6) | (s_rd_buf[i+3] & 0x3F); clen = 4; }
+        }
+        int cw = lv_font_get_glyph_width(&lv_font_cn_16, cp, 0);
+        if (cw <= 0) cw = 8;
+        if (wsum + cw > label_w) {                   /* 软换行 */
+            line++; wsum = cw;
+            if (line >= lines_per_page) { end = i; break; }  /* 本字作下页首 */
+        } else {
+            wsum += cw;
+        }
+        i += clen;
+    }
+
+    /* 3) 按字符解码 → 把字体缺失标点替换 → 重编码到 s_rd_disp，并压缩连续空行 */
+    size_t d = 0; int pnl = 0; size_t s = 0;
+    while (s < end) {
+        unsigned char b0 = (unsigned char)s_rd_buf[s];
+        uint32_t cp = b0; int clen = 1;
+        if (b0 >= 0x80) {
+            if ((b0 & 0xE0) == 0xC0) {                 /* 2 字节 */
+                if (s + 2 > end) { s = end; continue; }
+                cp = ((b0 & 0x1F) << 6)  | (s_rd_buf[s+1] & 0x3F); clen = 2;
+            } else if ((b0 & 0xF0) == 0xE0) {          /* 3 字节 */
+                if (s + 3 > end) { s = end; continue; }
+                cp = ((b0 & 0x0F) << 12) | ((s_rd_buf[s+1] & 0x3F) << 6)  | (s_rd_buf[s+2] & 0x3F); clen = 3;
+            } else if ((b0 & 0xF8) == 0xF0) {          /* 4 字节 */
+                if (s + 4 > end) { s = end; continue; }
+                cp = ((b0 & 0x07) << 18) | ((s_rd_buf[s+1] & 0x3F) << 12) | ((s_rd_buf[s+2] & 0x3F) << 6) | (s_rd_buf[s+3] & 0x3F); clen = 4;
+            } else { s += 1; continue; }              /* 非法续字节，跳过 */
+        }
+        if (cp == '\n') {
+            if (pnl) { s += clen; continue; }         /* 压缩连续空行 */
+            pnl = 1;
+            s_rd_disp[d++] = '\n';
+            s += clen;
+            continue;
+        }
+        pnl = 0;
+        cp = novel_fix_cp(cp);                        /* 字体缺失标点 → 字体里有的字符 */
+        if (cp < 0x80) s_rd_disp[d++] = (char)cp;
+        else if (cp < 0x800)   { s_rd_disp[d++] = (char)(0xC0 | (cp >> 6));      s_rd_disp[d++] = (char)(0x80 | (cp & 0x3F)); }
+        else if (cp < 0x10000) { s_rd_disp[d++] = (char)(0xE0 | (cp >> 12));     s_rd_disp[d++] = (char)(0x80 | ((cp >> 6) & 0x3F)); s_rd_disp[d++] = (char)(0x80 | (cp & 0x3F)); }
+        else                   { s_rd_disp[d++] = (char)(0xF0 | (cp >> 18));     s_rd_disp[d++] = (char)(0x80 | ((cp >> 12) & 0x3F)); s_rd_disp[d++] = (char)(0x80 | ((cp >> 6) & 0x3F)); s_rd_disp[d++] = (char)(0x80 | (cp & 0x3F)); }
+        s += clen;
+    }
+    s_rd_disp[d] = '\0';
+
+    /* 4) 下一页首：用 posmap 把显示位置映射回原始文件偏移（含 \r） */
+    g_rd_end = (end > 0) ? (s_rd_posmap[end - 1] + 1) : g_rd_pos;
+
+    if (g_hist_n == 0 || g_hist[g_hist_n - 1] != g_rd_pos) {   /* 记录翻页历史 */
+        if (g_hist_n < 64) g_hist[g_hist_n++] = g_rd_pos;
+    }
+
+    lv_label_set_text(g_novel_label, s_rd_disp);
+
+    int pno = 1;
+    if (g_cur.is_sd && g_cur.page_off) {
+        for (int k = 0; k < g_cur.pages; k++) {
+            if (g_cur.page_off[k] <= g_rd_end) pno = k + 1; else break;
+        }
+    } else {
+        size_t total = strlen(g_cur.flash_text);
+        if (total > 0) pno = (int)((double)g_rd_end / total * g_cur.pages) + 1;
+    }
     if (g_novel_page_lb) {
-        lv_label_set_text_fmt(g_novel_page_lb, "%d / %d", g_cur_page + 1, g_cur_pages);
+        lv_label_set_text_fmt(g_novel_page_lb, "%d / %d", pno, g_cur_pages);
     }
 }
 
@@ -2593,7 +2945,12 @@ static void novel_release_cb(lv_event_t *e)
     int32_t adx = dx < 0 ? -dx : dx;
     int32_t ady = dy < 0 ? -dy : dy;
     if (adx > 30 && adx > ady * 2) {          // 明显水平滑动才算翻页
-        novel_show_page(g_cur_page + (dx < 0 ? 1 : -1));
+        if (dx < 0) {                          // 左滑：下一页
+            g_rd_pos = g_rd_end;
+            novel_show_page(0);
+        } else {                               // 右滑：上一页
+            if (g_hist_n >= 2) { g_hist_n--; g_rd_pos = g_hist[g_hist_n - 1]; novel_show_page(0); }
+        }
     }
 }
 
@@ -2601,11 +2958,29 @@ static void novel_release_cb(lv_event_t *e)
 static void novel_book_cb(lv_event_t *e)
 {
     int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx < NOVEL_BOOK_COUNT) {
+        g_cur.is_sd      = false;
+        g_cur.flash_text = g_novel_books[idx].text;
+        g_cur.pages      = novel_page_count(g_cur.flash_text);
+        lv_label_set_text(g_novel_title, g_novel_books[idx].title);
+    } else {
+        int j = idx - NOVEL_BOOK_COUNT;
+        if (j < 0 || j >= g_sd_count) return;
+        if (!novel_sd_open(j)) return;           /* 打开/建表失败 */
+        g_cur.is_sd    = true;
+        g_cur.sd_idx   = j;
+        g_cur.fp       = g_sd_books[j].fp;
+        g_cur.page_off = g_sd_books[j].page_off;
+        g_cur.pages    = g_sd_books[j].pages;
+        lv_label_set_text(g_novel_title, g_sd_books[j].title);
+    }
     g_cur_book  = idx;
     g_cur_page  = 0;
-    g_cur_pages = novel_page_count(g_novel_books[idx].text);
+    g_cur_pages = g_cur.pages;
+    { int _lpp = novel_lines_per_page(); if (_lpp > 0 && _lpp < NOVEL_LINES_PER_PAGE) g_cur_pages = (g_cur_pages * NOVEL_LINES_PER_PAGE) / _lpp; }
+    g_rd_pos    = 0;            /* 进入新书，从开头流式分页 */
+    g_hist_n    = 0;
     g_novel_in_reader = true;
-    lv_label_set_text(g_novel_title, g_novel_books[idx].title);
     lv_obj_add_flag(g_novel_list, LV_OBJ_FLAG_HIDDEN);
     lv_obj_clear_flag(g_novel_reader, LV_OBJ_FLAG_HIDDEN);
     novel_show_page(0);
@@ -2616,6 +2991,11 @@ static void novel_top_back_cb(lv_event_t *e)
 {
     if (g_novel_in_reader) {
         g_novel_in_reader = false;
+        if (g_cur.is_sd && g_cur.sd_idx >= 0 && g_cur.sd_idx < g_sd_count) {
+            FILE *fp = g_sd_books[g_cur.sd_idx].fp;   /* 关闭当前书流，释放句柄（页表保留） */
+            if (fp) { fclose(fp); g_sd_books[g_cur.sd_idx].fp = NULL; }
+        }
+        g_cur.is_sd = false; g_cur.fp = NULL; g_cur.page_off = NULL;
         lv_label_set_text(g_novel_title, "小说");
         lv_obj_clear_flag(g_novel_list, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(g_novel_reader, LV_OBJ_FLAG_HIDDEN);
@@ -2668,7 +3048,9 @@ static void build_novel_screen(lv_obj_t *scr)
     lv_obj_set_style_pad_row(g_novel_list, 8, 0);
     lv_obj_set_scroll_dir(g_novel_list, LV_DIR_VER);
     lv_obj_set_scrollbar_mode(g_novel_list, LV_SCROLLBAR_MODE_AUTO);
-    for (int i = 0; i < NOVEL_BOOK_COUNT; i++) {
+    /* 书单行池：内置书 + SD 书上限；标题/可见性由 novel_refresh_list 填充 */
+    int pool = NOVEL_BOOK_COUNT + NOVEL_SD_MAX;
+    for (int i = 0; i < pool; i++) {
         lv_obj_t *row = lv_button_create(g_novel_list);
         lv_obj_set_width(row, lv_pct(100));
         lv_obj_set_height(row, 46);
@@ -2678,12 +3060,15 @@ static void build_novel_screen(lv_obj_t *scr)
         lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);   // 行不可单独滚动
         lv_obj_set_scrollbar_mode(row, LV_SCROLLBAR_MODE_OFF);
         lv_obj_t *nm = lv_label_create(row);
-        lv_label_set_text(nm, g_novel_books[i].title);
+        lv_label_set_text(nm, "");
         lv_obj_set_style_text_font(nm, &lv_font_cn_16, 0);
         lv_obj_set_style_text_color(nm, lv_color_white(), 0);
         lv_obj_center(nm);
         lv_obj_clear_flag(nm, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_event_cb(row, novel_book_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+        g_novel_rows[i] = row;
+        g_novel_row_name[i] = nm;
+        lv_obj_add_flag(row, LV_OBJ_FLAG_HIDDEN);   /* 进入时由 novel_refresh_list 填充 */
     }
 
     /* 阅读器（初始隐藏） */
@@ -2809,10 +3194,7 @@ static void lvgl_ui_bootstrap(void)
     backlight_init();                       /* 背光 PWM */
     backlight_set(g_brightness);            /* 默认全亮 */
     lvgl_touch_setup();                     /* 触摸输入 */
-    if (wifi_scan_init() != ESP_OK) {       /* WiFi 扫描后台任务 */
-        ESP_LOGE("WIFI", "wifi scan init failed");
-    }
-    weather_init();                         /* 天气后台任务 */
+    weather_init();                         /* 天气后台任务：栈用 PSRAM，不占内部 RAM，避免和 draw_buf 互挤 */
     pc_mon_init();                          /* 电脑监控后台任务 */
     /* 闹钟：从 NVS 载入上次设置。必须排在 wifi_scan_init() 之后，
      * 因为 nvs_flash_init() 是由它内部完成的 */
@@ -3004,12 +3386,23 @@ static void ui_weather_screen_refresh(void)
 
     bool changed = (g_weather.version != s_wx_shown_ver) ||
                    (g_weather.fetching != s_wx_fetching) ||
-                   s_wx_need_redraw;
+                   s_wx_need_redraw ||
+                   (g_wifi_state != s_wx_wifi_state);
     if (!changed) return;
 
     s_wx_need_redraw = false;
     s_wx_shown_ver = g_weather.version;
     s_wx_fetching  = g_weather.fetching;
+    s_wx_wifi_state = g_wifi_state;
+
+    if (g_wifi_state != WIFI_STA_CONNECTED) {
+        lv_label_set_text(g_wx_city, "--");
+        lv_label_set_text(g_wx_temp, "--.- °C");
+        lv_label_set_text(g_wx_desc, "WiFi 未连接");
+        lv_label_set_text(g_wx_extra, "请先连接 WiFi 后点刷新");
+        lv_label_set_text(g_wx_updated, "");
+        return;
+    }
     char buf[48];
     if (g_weather.fetching) {
         lv_label_set_text(g_wx_updated, "更新中...");
@@ -3080,6 +3473,55 @@ static void ui_handle_pending_password(void)
     lv_obj_clear_flag(g_pwd_panel, LV_OBJ_FLAG_HIDDEN);
 }
 
+/* ================= 内存/App 调试打印总开关 =================
+ * 默认 0 = 全部关闭(不参与编译)。改成 1 重新编译，即可开启：
+ *   LVMEM/HEAP(系统堆)、APPMEM(各 App 内存增量)、lv_timer_handler 耗时。
+ * 平时保持 0，避免串口刷屏与额外开销。 */
+#define UI_MEM_DEBUG 0
+
+#if UI_MEM_DEBUG
+/* ---------- App 内存占用对比：进入每个 App 自动算增量 ----------
+ * 进 App 前存快照，渲染稳定后(主循环延时 ~800ms)再取一次，差值即该 App 占用。 */
+static int      s_appmem_pending_id = -1;   /* 待测量的 App id，<0 表示无 */
+static uint32_t s_appmem_fire_ms    = 0;    /* 延时测量触发时刻 */
+static int      s_appmem_p_int = 0;         /* 进入前 INT free */
+static int      s_appmem_p_big = 0;         /* 进入前 INT 最大连续块 */
+static int      s_appmem_p_ps  = 0;         /* 进入前 PSRAM free */
+
+static const char *app_id_name(int id)
+{
+    switch (id) {
+    case APP_WIFI:     return "WiFi";
+    case APP_SETTINGS: return "设置";
+    case APP_CLOCK:    return "时钟";
+    case APP_MUSIC:    return "音乐";
+    case APP_GAME:     return "游戏";
+    case APP_WEATHER:  return "天气";
+    case APP_NOVEL:    return "小说";
+    case APP_PCMON:    return "电脑监控";
+    case APP_ALARM:    return "闹钟";
+    case APP_BLE:      return "蓝牙";
+    case APP_FILES:    return "文件";
+    default:           return "?";
+    }
+}
+
+static void ui_appmem_poll(void)
+{
+    if (s_appmem_pending_id < 0) return;
+    if (lv_tick_get() < s_appmem_fire_ms) return;   /* 等渲染稳定 */
+    int fi = (int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    int bi = (int)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+    int fp = (int)heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    ESP_LOGW("APPMEM", "进入[%s] 增量: INT free%+d (%d->%d) big%+d (%d->%d) | PSRAM free%+d (%d->%d)",
+             app_id_name(s_appmem_pending_id),
+             fi - s_appmem_p_int, s_appmem_p_int, fi,
+             bi - s_appmem_p_big, s_appmem_p_big, bi,
+             fp - s_appmem_p_ps,  s_appmem_p_ps,  fp);
+    s_appmem_pending_id = -1;
+}
+#endif /* UI_MEM_DEBUG */
+
 /* 延迟跳转：点击 App 时只置位 g_pending_app，真正建屏/加载在这里执行，
  * 不在输入事件回调里重入 lv_timer_handler 同步建大量对象（否则卡死看门狗） */
 static void ui_handle_pending_app(void)
@@ -3087,6 +3529,12 @@ static void ui_handle_pending_app(void)
     if (g_pending_app < 0) return;
     int id = g_pending_app;
     g_pending_app = -1;
+#if UI_MEM_DEBUG
+    /* 记录进入前快照(上一个 App 的稳定态)，用于算这个 App 的内存增量 */
+    s_appmem_p_int = (int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    s_appmem_p_big = (int)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+    s_appmem_p_ps  = (int)heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+#endif
     lv_obj_t *scr = NULL;
     switch (id) {
     case APP_WIFI:
@@ -3143,6 +3591,7 @@ static void ui_handle_pending_app(void)
             build_novel_screen(g_novel_screen);
         }
         scr = g_novel_screen;
+        novel_refresh_list();   /* 每次进都重扫 SD 卡小说文件夹 */
         break;
     case APP_PCMON:
         if (!g_pcmon_screen) {
@@ -3189,6 +3638,11 @@ static void ui_handle_pending_app(void)
         /* 只有停留在监控界面时才让 pc_mon 联网拉数据，其余界面一律停止 */
         pc_mon_set_active(scr == g_pcmon_screen);
     }
+#if UI_MEM_DEBUG
+    /* 进入后延迟 ~800ms(等切换动画/渲染/图片解码稳定)再算这个 App 的占用增量 */
+    s_appmem_pending_id = id;
+    s_appmem_fire_ms = lv_tick_get() + 800;
+#endif
 }
 
 /* 触摸红点：按下时显示并跟随手指坐标，松开时隐藏。
@@ -3339,6 +3793,7 @@ static void ui_ble_detail_refresh(void)
  * 目的：定位 task_wdt 复位。打印 LV_MEM 使用率 / 碎片率 / 最大连续空闲块，
  * 以及单次 lv_timer_handler() 的耗时。确认问题后整段删除即可。
  * ---------------------------------------------------------- */
+#if UI_MEM_DEBUG
 static void ui_mem_dump(const char *tag)
 {
     lv_mem_monitor_t mon;
@@ -3356,19 +3811,28 @@ static void ui_mem_dump_periodic(void)
 {
     static uint32_t s_last_ms = 0;
     uint32_t now = lv_tick_get();
-    if (now - s_last_ms < 5000) return;
+    if (s_last_ms && now - s_last_ms < 5000) return;  /* s_last_ms==0 时先打一次开机基线 */
     s_last_ms = now;
     ui_mem_dump("5s");
-    /* 系统堆诊断：LVGL 那个池主要在 PSRAM，看不出内部 DRAM 的压力。
-     * 内部 RAM 不够时会表现为 SDMMC 报 NO_MEM、WiFi 四次握手超时断连，
-     * 所以这里把「内部 / DMA / 开机至今最低水位」一起打出来。 */
-    ESP_LOGW("HEAP", "[5s] 内部 free=%u 最低=%u | DMA free=%u 最低=%u | PSRAM free=%u",
+    /* 系统堆详细诊断：每个区域打 total/free/最大连续块/历史最低，用于判断优化空间。
+     * - INT/DMA 其实是同一片内部 DRAM；DMA 的 big 决定能否分到大 DMA 缓冲(SD/WiFi);
+     * - PSRAM 决定图片/文件缓冲等大块余量(LVGL 池也主要在这里)。 */
+    ESP_LOGW("HEAP", "[5s] INT   total=%u free=%u big=%u min=%u",
+             (unsigned)heap_caps_get_total_size(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
+    ESP_LOGW("HEAP", "[5s] DMA   free=%u big=%u min=%u (total同INT)",
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
-             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_DMA),
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA),
+             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_DMA));
+    ESP_LOGW("HEAP", "[5s] PSRAM total=%u free=%u big=%u min=%u",
+             (unsigned)heap_caps_get_total_size(MALLOC_CAP_SPIRAM),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM),
+             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM));
 }
+#endif /* UI_MEM_DEBUG */
 
 /* LVGL 主循环放在独立任务里运行，给足栈空间避免栈溢出 */
 static void lvgl_task(void *arg)
@@ -3382,6 +3846,9 @@ static void lvgl_task(void *arg)
         wifi_status_update();
         update_detail_ui();
         ui_ble_detail_refresh();
+#if UI_MEM_DEBUG
+        ui_appmem_poll();   /* App 切换后延迟测量内存增量 */
+#endif
 
         /* 各屏数据周期性刷新：天气自动拉取、时钟、状态栏时钟、天气屏 */
         ui_weather_periodic();
@@ -3394,24 +3861,34 @@ static void lvgl_task(void *arg)
 
         /* 延迟任务：密码面板、App 跳转、触摸红点、WiFi 列表刷新 */
         ui_handle_pending_password();
+#if UI_MEM_DEBUG
         int opened_app = g_pending_app;           /* 诊断：本圈是否打开了 App */
+#endif
         ui_handle_pending_app();
+#if UI_MEM_DEBUG
         if (opened_app >= 0) ui_mem_dump("app");  /* 建屏后立刻打印，看单个 App 吃掉多少 */
+#endif
         // ui_refresh_touch_dot();           /* 触摸红点不再使用（INT 中断后无需可视化调试） */
         ui_refresh_wifi_list();
         ui_refresh_ble_list();
 
+#if UI_MEM_DEBUG
         /* 诊断：每 5 秒打印一次 LV_MEM 占用 */
         ui_mem_dump_periodic();
+#endif
 
         /* 贪吃蛇每帧更新: 蛇移动 + 碰撞检测 */
         snake_update();
 
         /* 处理 LVGL 任务，返回建议休眠 ms */
+#if UI_MEM_DEBUG
         uint32_t t0 = lv_tick_get();
+#endif
         uint32_t t = lv_timer_handler();
+#if UI_MEM_DEBUG
         uint32_t dt = lv_tick_get() - t0;
         if (dt > 200) ESP_LOGW("LVMEM", "lv_timer_handler took %u ms", (unsigned)dt);
+#endif
         ui_fps_update();                    /* 诊断：帧率显示 */
 
         /* FREERTOS_HZ=100 时 pdMS_TO_TICKS() 会把 <10ms 的值取整成 0,

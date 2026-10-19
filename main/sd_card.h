@@ -22,7 +22,7 @@
 #define SDMMC_PIN_D3    2
 
 #define SD_MOUNT_POINT  "/sdcard"
-#define SD_FREQ_KHZ     10000        /* 当前总线速率 10MHz */
+#define SD_FREQ_KHZ     4000         /* 总线速率 4MHz（降速提升廉价卡/走线偏差卡的读稳定性） */
 
 typedef struct {
     bool     mounted;           /* 是否已成功挂载 FATFS */

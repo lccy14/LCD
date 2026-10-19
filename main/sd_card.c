@@ -117,9 +117,9 @@ static esp_err_t mount_with_retry(int width, int freq_khz)
  */
 typedef struct { int width; int freq_khz; } sd_try_t;
 static const sd_try_t s_try_list[] = {
-    { 4, SD_FREQ_KHZ },
-    { 4, 4000 },
-    { 1, SD_FREQ_KHZ },
+    { 1, 4000 },            /* 最稳优先：1 线 4MHz，绕开 D1~D3 走线不等长/上拉不足 */
+    { 4, 4000 },            /* 4 线降速重试 */
+    { 4, SD_FREQ_KHZ },     /* 4 线原速（卡座信号好时使用） */
 };
 
 /* 4 线全部失败后的「体检」：用 400kHz（SD 初始化速率，几乎不受走线影响）探一次。

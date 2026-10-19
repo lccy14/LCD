@@ -4,6 +4,7 @@
 #include "esp_crt_bundle.h" /* esp_crt_bundle_attach，用于校验服务器证书 */
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_heap_caps.h" /* xTaskCreateWithCaps 的 MALLOC_CAP_SPIRAM */
 #include <string.h>
 #include <stdlib.h>
 #include "freertos/FreeRTOS.h"
@@ -11,6 +12,10 @@
 #include "freertos/semphr.h"
 
 static const char *TAG = "WEATHER";
+
+/* 天气调试日志开关：默认 0(关闭)。改 1 可打印 任务启动/唤醒 定位日志。
+ * 注意: weather updated / geocode / forecast 失败 属功能日志，始终打印。 */
+#define WEATHER_DEBUG 0
 
 #define WX_DEFAULT_CITY "Shanghai"
 /* 手动指定城市：留空("")则自动定位（公网 IP，可能跨城市不准）；
@@ -237,6 +242,9 @@ static void weather_task(void *arg)
 
     for (;;) {
         xSemaphoreTake(s_req_sem, portMAX_DELAY);
+#if WEATHER_DEBUG
+        ESP_LOGI(TAG, "weather task woke, wifi_state=%d", g_wifi_state);
+#endif
 
         if (g_wifi_state != WIFI_STA_CONNECTED) {
             ESP_LOGW(TAG, "WiFi not connected, skip weather fetch");
@@ -353,7 +361,19 @@ static void weather_task(void *arg)
 void weather_init(void)
 {
     s_req_sem = xSemaphoreCreateBinary();
-    xTaskCreate(weather_task, "weather", 32768, NULL, 3, NULL);
+    /* 栈放 PSRAM：HTTPS 抓取需 ~32KB 栈，若放内部 RAM 会和 LVGL 的两块 38400B
+     * draw_buf 互相挤占，导致任一方分配失败(屏幕卡死 / 任务没建却打了 started)。
+     * PSRAM 充裕(>800KB)，把任务栈放那里，屏幕与天气两者兼顾。 */
+    BaseType_t ok = xTaskCreateWithCaps(weather_task, "weather", 32768, NULL, 3, NULL,
+                                        MALLOC_CAP_SPIRAM);
+    if (ok != pdPASS) {
+        /* 极端情况 PSRAM 也失败：降档用内部 RAM 小栈兜底 */
+        ESP_LOGE(TAG, "PSRAM-stack task create failed (%d), retry internal @24KB", (int)ok);
+        ok = xTaskCreate(weather_task, "weather", 24576, NULL, 3, NULL);
+    }
+#if WEATHER_DEBUG
+    ESP_LOGI(TAG, "weather task started (create=%d)", (int)ok);
+#endif
 }
 
 void weather_request(const char *city)
