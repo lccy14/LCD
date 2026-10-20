@@ -3,16 +3,9 @@
 
 #include <stdint.h>
 #include <stdbool.h>
-#include "driver/gpio.h"
+#include "board.h"   /* 引脚 / I2C 地址集中定义，换板只改 board.h */
 
-/* 引脚（ESP32 侧接线：SDA=5/SCL=4/INT=40，避开 LCD 并口占用的 35/36/37） */
-#define FT6336_SDA_GPIO  GPIO_NUM_5
-#define FT6336_SCL_GPIO  GPIO_NUM_4
-#define FT6336_INT_GPIO  GPIO_NUM_40
-
-/* I2C 地址：FT6336 通常为 0x38（部分模组 0x39） */
-#define FT6336_I2C_ADDR  0x38
-#define FT6336_I2C_PORT  I2C_NUM_0
+#define FT6336_I2C_PORT I2C_NUM_0    /* I2C 控制器编号：驱动层选哪条总线，非 GPIO 接线 */
 
 /* 一个触摸点的状态 */
 typedef struct {

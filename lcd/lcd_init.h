@@ -15,25 +15,8 @@
 #define LCD_H 240
 #endif
 
-//-----------------LCD 并行 8bit 接口引脚 (ESP32-S3 GPIO)----------------
-// 按用户指定接线：ST7789 并行 8bit 接口
-#define LCD_CS_GPIO     GPIO_NUM_37  // 片选
-#define LCD_DC_GPIO     GPIO_NUM_35  // 数据/命令 (RS)
-#define LCD_WR_GPIO     GPIO_NUM_36  // 写时钟 (PCLK)
-#define LCD_RST_GPIO    GPIO_NUM_21  // 复位
-#define LCD_BLK_GPIO    GPIO_NUM_38  // 背光
-
-// 8bit 数据总线（D0-D7）
-#define LCD_D0_GPIO     GPIO_NUM_6   // D0
-#define LCD_D1_GPIO     GPIO_NUM_7   // D1
-#define LCD_D2_GPIO     GPIO_NUM_17  // D2
-#define LCD_D3_GPIO     GPIO_NUM_18  // D3
-#define LCD_D4_GPIO     GPIO_NUM_8   // D4
-#define LCD_D5_GPIO     GPIO_NUM_19  // D5
-#define LCD_D6_GPIO     GPIO_NUM_20  // D6
-#define LCD_D7_GPIO     GPIO_NUM_3   // D7
-
-// RD 引脚在并口只读屏幕上必须接 3.3V，软件不控制
+// 引脚集中到 board.h：换板只改 board.h，本驱动不出现裸 GPIO 号
+#include "board.h"
 
 // 控制宏（保留兼容，方便其他文件直接操作）
 #define LCD_CS_Clr()   gpio_set_level(LCD_CS_GPIO, 0)

@@ -5,21 +5,11 @@
 #include "esp_err.h"
 
 /* SD 卡：ESP32-S3 的 SDMMC 主机（非 SPI）。
- * 引脚（见 wiring_diagram.txt）:
- *   CLK GPIO41 — 时钟线，主机输出，决定总线速率
- *   CMD GPIO42 — 命令线，双向
- *   D0  GPIO47 — 数据线 0，1 线模式下唯一的传输线
- *   D1/D2/D3 GPIO48/1/2 — 数据线 1~3，仅 4 线模式启用（带宽 ×4）
- *
+ * 引脚集中在 board.h（SDMMC_PIN_*）；换板只改 board.h。
  * 1 线模式只用 CLK/CMD/D0；4 线模式再启用 D1~D3。
  * 本模块先按 4 线挂载，失败自动回退 1 线，兼容只接了 D0 的卡座。
  */
-#define SDMMC_PIN_CLK   41
-#define SDMMC_PIN_CMD   42
-#define SDMMC_PIN_D0    47
-#define SDMMC_PIN_D1    48
-#define SDMMC_PIN_D2    1
-#define SDMMC_PIN_D3    2
+#include "board.h"
 
 #define SD_MOUNT_POINT  "/sdcard"
 #define SD_FREQ_KHZ     4000         /* 总线速率 4MHz（降速提升廉价卡/走线偏差卡的读稳定性） */
