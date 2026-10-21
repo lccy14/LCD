@@ -25,7 +25,8 @@ typedef enum {
     APP_PCMON,
     APP_ALARM,
     APP_BLE,
-    APP_FILES
+    APP_FILES,
+    APP_SYSINFO
 } app_id_t;
 
 /* 打开某个 App 界面：带屏幕切换动画（当前用的是 MOVE_LEFT，两屏一起左移） */

@@ -261,6 +261,10 @@ static wifi_row_t g_rows[WIFI_LIST_ROWS];
 
 /* 待跳转的 App（点击后不在事件回调里同步建屏，避免重入 + 一次性建大量对象卡死看门狗） */
 static int g_pending_app = -1;
+/* 当前已加载到屏幕的 App：主循环据此按活动屏门控刷新，系统信息定时器也据此按需启停 */
+static app_id_t g_active_app = APP_NONE;
+/* 系统信息屏 1s 刷新定时器（仅在“关于本机”屏可见时才运行，避免无谓刷新不可见标签） */
+static lv_timer_t *g_sysinfo_timer = NULL;
 
 /* 触摸相关：FT6336 实时坐标 + 屏幕上的红色指示点 */
 static lv_obj_t      *g_red_dot = NULL;
@@ -629,14 +633,21 @@ static void ui_switch(lv_obj_t *scr, bool back)
 
 void ui_open_screen_anim(lv_obj_t *scr, app_id_t id)
 {
-    (void)id;
     if (!scr) return;
     ui_switch(scr, false);      /* 进 App：新屏从右边压进来 */
+    g_active_app = id;
+    /* 系统信息定时器仅在“关于本机”屏可见时运行，进出时启停避免常驻空刷 */
+    if (g_sysinfo_timer) {
+        if (id == APP_SYSINFO) lv_timer_resume(g_sysinfo_timer);
+        else                   lv_timer_pause(g_sysinfo_timer);
+    }
 }
 
 /* 供 pvz.c 等外部界面调用: 跳回主界面（往回退，方向相反） */
 void ui_go_home(void) {
     pc_mon_set_active(false);   /* 离开 App 界面，停止监控数据拉取 */
+    g_active_app = APP_NONE;
+    if (g_sysinfo_timer) lv_timer_pause(g_sysinfo_timer);
     ui_switch(g_home, true);    /* 回主页：主页从左边推回来 */
 }
 
@@ -808,43 +819,120 @@ static void brightness_cb(lv_event_t *e)
     }
 }
 
-/* 设置界面：状态栏 + 返回栏（复用 make_app_screen）+ 亮度滑动条 */
+/* 设置列表里的一条手机风格分隔线（左右各留 14px 缩进） */
+static void settings_add_separator(lv_obj_t *parent)
+{
+    lv_obj_t *sep = lv_obj_create(parent);
+    lv_obj_set_width(sep, LV_PCT(100));
+    lv_obj_set_height(sep, 1);
+    lv_obj_set_style_margin_left(sep, 14, 0);
+    lv_obj_set_style_margin_right(sep, 14, 0);
+    lv_obj_set_style_bg_color(sep, lv_color_hex(0x2A2A33), 0);
+    lv_obj_set_style_border_opa(sep, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_radius(sep, 0, 0);
+    lv_obj_set_style_pad_all(sep, 0, 0);
+    lv_obj_clear_flag(sep, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(sep, LV_SCROLLBAR_MODE_OFF);
+}
+
+/* “关于本机”行：点开系统信息屏（复用 APP_SYSINFO，走延迟跳转避免看门狗） */
+static void settings_about_cb(lv_event_t *e)
+{
+    (void)e;
+    g_pending_app = APP_SYSINFO;
+}
+
+/* 设置界面：手机风格的设置列表（可滚动），亮度为其中一项 */
 static void build_settings_screen(lv_obj_t *scr)
 {
-    lv_obj_t *cap = lv_label_create(scr);
+    /* 滚动列表容器：顶部 66px 留给 make_app_screen 的返回栏 */
+    lv_obj_t *list = lv_obj_create(scr);
+    lv_obj_set_size(list, LCD_W, LCD_H - 66);
+    lv_obj_align(list, LV_ALIGN_TOP_LEFT, 0, 66);
+    lv_obj_set_style_bg_opa(list, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_opa(list, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_radius(list, 0, 0);
+    lv_obj_set_style_pad_all(list, 0, 0);
+    lv_obj_set_style_pad_row(list, 0, 0);
+    lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_scroll_dir(list, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(list, LV_SCROLLBAR_MODE_AUTO);
+
+    /* ---------- 亮度 ---------- */
+    lv_obj_t *br = lv_obj_create(list);
+    lv_obj_set_width(br, LV_PCT(100));
+    lv_obj_set_height(br, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(br, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_opa(br, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_radius(br, 0, 0);
+    lv_obj_set_style_pad_hor(br, 14, 0);
+    lv_obj_set_style_pad_top(br, 14, 0);
+    lv_obj_set_style_pad_bottom(br, 14, 0);
+    lv_obj_set_style_pad_row(br, 8, 0);
+    lv_obj_set_flex_flow(br, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(br, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(br, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(br, LV_SCROLLBAR_MODE_OFF);
+
+    lv_obj_t *br_head = lv_obj_create(br);
+    lv_obj_set_width(br_head, LV_PCT(100));
+    lv_obj_set_height(br_head, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(br_head, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_opa(br_head, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_radius(br_head, 0, 0);
+    lv_obj_set_style_pad_all(br_head, 0, 0);
+    lv_obj_set_flex_flow(br_head, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(br_head, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(br_head, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(br_head, LV_SCROLLBAR_MODE_OFF);
+
+    lv_obj_t *cap = lv_label_create(br_head);
     lv_label_set_text(cap, "亮度");
     lv_obj_set_style_text_font(cap, &lv_font_cn_16, 0);
     lv_obj_set_style_text_color(cap, lv_color_white(), 0);
-    lv_obj_set_pos(cap, 16, 76);
 
-    g_br_label = lv_label_create(scr);
+    g_br_label = lv_label_create(br_head);
     lv_label_set_text_fmt(g_br_label, "%d%%", g_brightness);
-    lv_obj_set_style_text_font(g_br_label, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_font(g_br_label, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(g_br_label, lv_color_hex(0x9AA0B5), 0);
-    lv_obj_set_width(g_br_label, 60);
-    lv_obj_set_style_text_align(g_br_label, LV_TEXT_ALIGN_RIGHT, 0);
-    lv_obj_set_pos(g_br_label, 244, 76);
+    lv_obj_clear_flag(g_br_label, LV_OBJ_FLAG_CLICKABLE);
 
-    lv_obj_t *sl = lv_slider_create(scr);
-    lv_obj_set_size(sl, 288, 20);
-    lv_obj_set_pos(sl, 16, 116);
+    lv_obj_t *sl = lv_slider_create(br);
+    lv_obj_set_width(sl, LV_PCT(100));
+    lv_obj_set_height(sl, 12);
     lv_slider_set_range(sl, BLK_MIN_PERCENT, 100);
     lv_slider_set_value(sl, g_brightness, LV_ANIM_OFF);
     lv_obj_set_scrollbar_mode(sl, LV_SCROLLBAR_MODE_OFF);
     lv_obj_add_event_cb(sl, brightness_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
-    /* 两端提示文字 */
-    lv_obj_t *mn = lv_label_create(scr);
-    lv_label_set_text(mn, "10%");
-    lv_obj_set_style_text_font(mn, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(mn, lv_color_hex(0x9AA0B5), 0);
-    lv_obj_set_pos(mn, 16, 142);
+    settings_add_separator(list);
 
-    lv_obj_t *mx = lv_label_create(scr);
-    lv_label_set_text(mx, "100%");
-    lv_obj_set_style_text_font(mx, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(mx, lv_color_hex(0x9AA0B5), 0);
-    lv_obj_set_pos(mx, 268, 142);
+    /* ---------- 关于本机 ---------- */
+    lv_obj_t *about = lv_obj_create(list);
+    lv_obj_set_width(about, LV_PCT(100));
+    lv_obj_set_height(about, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(about, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_opa(about, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_radius(about, 0, 0);
+    lv_obj_set_style_pad_hor(about, 14, 0);
+    lv_obj_set_style_pad_top(about, 14, 0);
+    lv_obj_set_style_pad_bottom(about, 14, 0);
+    lv_obj_set_flex_flow(about, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(about, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(about, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(about, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_add_event_cb(about, settings_about_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *at = lv_label_create(about);
+    lv_label_set_text(at, "关于本机");
+    lv_obj_set_style_text_font(at, &lv_font_cn_16, 0);
+    lv_obj_set_style_text_color(at, lv_color_white(), 0);
+    lv_obj_clear_flag(at, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t *chev = lv_label_create(about);
+    lv_label_set_text(chev, LV_SYMBOL_RIGHT);
+    lv_obj_set_style_text_color(chev, lv_color_hex(0x9AA0B5), 0);
+    lv_obj_clear_flag(chev, LV_OBJ_FLAG_CLICKABLE);
 }
 
 /* 在 App 屏幕中央放一行占位文字 */
@@ -3487,7 +3575,108 @@ static uint32_t s_appmem_fire_ms    = 0;    /* 延时测量触发时刻 */
 static int      s_appmem_p_int = 0;         /* 进入前 INT free */
 static int      s_appmem_p_big = 0;         /* 进入前 INT 最大连续块 */
 static int      s_appmem_p_ps  = 0;         /* 进入前 PSRAM free */
+#endif /* UI_MEM_DEBUG */
 
+/* ================= 系统信息屏 =================
+ * 展示 CPU/内存/PSRAM/芯片/SDK/MAC/网络/温度/编译时间，每秒刷新。
+ * 温度读取依赖 temperature_sensor 驱动组件；若该组件未加入工程
+ * （main/CMakeLists 的 REQUIRES 含 temperature_sensor），头文件不在
+ * 搜索路径，__has_include 为假，自动降级为“未启用”文本，不影响编译。 */
+#include "esp_system.h"
+#include "esp_heap_caps.h"
+#include "esp_chip_info.h"
+#include "esp_mac.h"
+#include "esp_private/esp_clk.h"
+#if __has_include("driver/temperature_sensor.h")
+#include "driver/temperature_sensor.h"
+#define SYSINFO_HAS_TEMP 1
+#endif
+
+static lv_obj_t *g_sysinfo_screen = NULL;
+/* g_sysinfo_timer 已统一在文件顶部声明 */
+static lv_obj_t *g_sysinfo_labels[11];
+#ifdef SYSINFO_HAS_TEMP
+static temperature_sensor_handle_t s_ts = NULL;
+#endif
+
+static void sysinfo_timer_cb(lv_timer_t *t)
+{
+    (void)t;
+    uint8_t mac[6];
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    int f  = (int)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024);
+    int b  = (int)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024);
+    int pf = (int)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024);
+    int pt = (int)(heap_caps_get_total_size(MALLOC_CAP_SPIRAM) / 1024);
+    esp_chip_info_t ci; esp_chip_info(&ci);
+
+    lv_label_set_text_fmt(g_sysinfo_labels[0],  "CPU 频率:    %d MHz", esp_clk_cpu_freq() / 1000000);
+    lv_label_set_text_fmt(g_sysinfo_labels[1],  "内部 RAM:    空闲 %d KB", f);
+    lv_label_set_text_fmt(g_sysinfo_labels[2],  "内部 RAM:    最大块 %d KB", b);
+    lv_label_set_text_fmt(g_sysinfo_labels[3],  "PSRAM:       空闲 %d KB", pf);
+    lv_label_set_text_fmt(g_sysinfo_labels[4],  "PSRAM:       总量 %d KB", pt);
+    lv_label_set_text_fmt(g_sysinfo_labels[5],  "芯片:        ESP32-S3  x%d", ci.cores);
+    lv_label_set_text_fmt(g_sysinfo_labels[6],  "SDK:         %s", esp_get_idf_version());
+    lv_label_set_text_fmt(g_sysinfo_labels[7],  "MAC:         %02X:%02X:%02X:%02X:%02X:%02X",
+                          mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    lv_label_set_text_fmt(g_sysinfo_labels[8],  "WiFi:        %s", g_wifi_on ? "已连接" : "未连接");
+#ifdef SYSINFO_HAS_TEMP
+    if (s_ts) {
+        float tp = 0;
+        if (temperature_sensor_get_celsius(s_ts, &tp) == ESP_OK) {
+            /* lv_label_set_text_fmt 底层 lv_snprintf 默认不支持 %f，
+             * 故用标准库 snprintf 格式化（与天气温度同一做法），避免打印出 "f" */
+            char tbuf[32];
+            snprintf(tbuf, sizeof(tbuf), "芯片温度:    %.1f °C", (double)tp);
+            lv_label_set_text(g_sysinfo_labels[9], tbuf);
+        } else {
+            lv_label_set_text(g_sysinfo_labels[9], "芯片温度:    读取失败");
+        }
+    } else {
+        lv_label_set_text(g_sysinfo_labels[9], "芯片温度:    未启用");
+    }
+#else
+    lv_label_set_text(g_sysinfo_labels[9], "芯片温度:    未启用(需 temperature_sensor)");
+#endif
+    lv_label_set_text_fmt(g_sysinfo_labels[10], "编译:        %s %s", __DATE__, __TIME__);
+}
+
+static void build_sysinfo_screen(lv_obj_t *scr)
+{
+    lv_obj_t *cont = lv_obj_create(scr);
+    lv_obj_set_size(cont, LCD_W - 10, LCD_H - 86);
+    lv_obj_align(cont, LV_ALIGN_TOP_MID, 0, 62);
+    lv_obj_set_style_bg_opa(cont, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_opa(cont, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_shadow_opa(cont, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_radius(cont, 0, 0);
+    lv_obj_set_style_pad_all(cont, 6, 0);
+    lv_obj_set_flex_flow(cont, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(cont, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_set_style_pad_row(cont, 8, 0);
+    lv_obj_add_flag(cont, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(cont, LV_DIR_VER);
+
+    for (int i = 0; i < 11; i++) {
+        lv_obj_t *l = lv_label_create(cont);
+        lv_obj_set_width(l, LCD_W - 22);
+        lv_obj_set_style_text_font(l, &lv_font_cn_16, 0);
+        lv_obj_set_style_text_color(l, lv_color_white(), 0);
+        lv_label_set_text(l, "");
+        g_sysinfo_labels[i] = l;
+    }
+
+#ifdef SYSINFO_HAS_TEMP
+    temperature_sensor_config_t cfg = TEMPERATURE_SENSOR_CONFIG_DEFAULT(-10, 80);
+    if (temperature_sensor_install(&cfg, &s_ts) != ESP_OK) s_ts = NULL;
+    if (s_ts) temperature_sensor_enable(s_ts);
+#endif
+
+    g_sysinfo_timer = lv_timer_create(sysinfo_timer_cb, 1000, NULL);
+    sysinfo_timer_cb(g_sysinfo_timer);   /* 进界面立即刷一次 */
+}
+
+#if UI_MEM_DEBUG
 static const char *app_id_name(int id)
 {
     switch (id) {
@@ -3502,6 +3691,7 @@ static const char *app_id_name(int id)
     case APP_ALARM:    return "闹钟";
     case APP_BLE:      return "蓝牙";
     case APP_FILES:    return "文件";
+    case APP_SYSINFO:  return "系统";
     default:           return "?";
     }
 }
@@ -3620,6 +3810,13 @@ static void ui_handle_pending_app(void)
             build_file_manager_screen(g_files_screen);
         }
         scr = g_files_screen;
+        break;
+    case APP_SYSINFO:
+        if (!g_sysinfo_screen) {
+            g_sysinfo_screen = make_app_screen("系统");
+            build_sysinfo_screen(g_sysinfo_screen);
+        }
+        scr = g_sysinfo_screen;
         break;
     default:
         break;
@@ -3850,16 +4047,21 @@ static void lvgl_task(void *arg)
         ui_appmem_poll();   /* App 切换后延迟测量内存增量 */
 #endif
 
-        /* 各屏数据周期性刷新：天气自动拉取、时钟、状态栏时钟、天气屏 */
+        /* 各屏数据周期性刷新：天气自动拉取、状态栏时钟 */
         ui_weather_periodic();
-        ui_clock_refresh();
-        ui_alarm_refresh();
+        ui_alarm_refresh();           /* 闹钟弹窗可能覆盖任意屏，不按活动屏门控 */
         ui_status_clocks_refresh();   /* 状态栏时钟（恢复） */
-        ui_weather_screen_refresh();
-        ui_pcmon_screen_refresh();
-        file_mgr_periodic();          /* 文件管理：挂载 / 列目录 / 预览 / 删除 */
+        ui_weather_screen_refresh();  /* 内部已按活动屏保护 */
+        ui_pcmon_screen_refresh();    /* 内部已按活动屏保护 */
+        file_mgr_periodic();          /* 文件命令队列，可能屏外触发，不门控 */
 
-        /* 延迟任务：密码面板、App 跳转、触摸红点、WiFi 列表刷新 */
+        /* 下面这些刷新只服务于各自专属屏，按当前活动 App 门控，避免每帧空跑 */
+        if (g_active_app == APP_CLOCK) ui_clock_refresh();
+        if (g_active_app == APP_WIFI)  ui_refresh_wifi_list();
+        if (g_active_app == APP_BLE)   ui_refresh_ble_list();
+        if (g_active_app == APP_GAME)  snake_update();
+
+        /* 延迟任务：密码面板、App 跳转 */
         ui_handle_pending_password();
 #if UI_MEM_DEBUG
         int opened_app = g_pending_app;           /* 诊断：本圈是否打开了 App */
@@ -3869,16 +4071,11 @@ static void lvgl_task(void *arg)
         if (opened_app >= 0) ui_mem_dump("app");  /* 建屏后立刻打印，看单个 App 吃掉多少 */
 #endif
         // ui_refresh_touch_dot();           /* 触摸红点不再使用（INT 中断后无需可视化调试） */
-        ui_refresh_wifi_list();
-        ui_refresh_ble_list();
 
 #if UI_MEM_DEBUG
         /* 诊断：每 5 秒打印一次 LV_MEM 占用 */
         ui_mem_dump_periodic();
 #endif
-
-        /* 贪吃蛇每帧更新: 蛇移动 + 碰撞检测 */
-        snake_update();
 
         /* 处理 LVGL 任务，返回建议休眠 ms */
 #if UI_MEM_DEBUG
