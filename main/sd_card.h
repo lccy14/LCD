@@ -7,12 +7,12 @@
 /* SD 卡：ESP32-S3 的 SDMMC 主机（非 SPI）。
  * 引脚集中在 board.h（SDMMC_PIN_*）；换板只改 board.h。
  * 1 线模式只用 CLK/CMD/D0；4 线模式再启用 D1~D3。
- * 本模块先按 4 线挂载，失败自动回退 1 线，兼容只接了 D0 的卡座。
+ * 本模块按「1 线优先」的档位列表依次尝试，成功即停，兼容只接了 D0 的卡座。
  */
 #include "board.h"
 
 #define SD_MOUNT_POINT  "/sdcard"
-#define SD_FREQ_KHZ     4000         /* 总线速率 4MHz（降速提升廉价卡/走线偏差卡的读稳定性） */
+#define SD_FREQ_KHZ     40000        /* 总线速率 40MHz（SD High Speed；卡不支持 HS 时驱动自动降到 20MHz） */
 
 typedef struct {
     bool     mounted;           /* 是否已成功挂载 FATFS */
@@ -27,8 +27,8 @@ typedef struct {
 extern sd_card_info_t g_sdcard;
 
 /* 挂载 SD 卡（FATFS 挂到 SD_MOUNT_POINT）。
- * width4=true 时依次尝试：4线10MHz → 4线4MHz → 1线10MHz，成功即停；
- * width4=false 只用 1 线 10MHz。
+ * 依次尝试：1线40MHz → 1线4MHz → 4线4MHz → 4线40MHz，成功即停；
+ * width4=false 时跳过所有 4 线档位，只用 1 线。
  * 未格式化 / 无卡 / 接线错误都返回非 ESP_OK，不会格式化用户的数据。
  */
 esp_err_t sd_card_mount(bool width4);

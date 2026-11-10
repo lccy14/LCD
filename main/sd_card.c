@@ -75,16 +75,23 @@ static esp_err_t mount_with_width(int width, int freq_khz)
     s_card = card;
     g_sdcard.mounted        = true;
     g_sdcard.width          = width;
-    g_sdcard.freq_khz       = freq_khz;
+    /* real_freq_khz 是驱动与卡协商后真正配置到控制器的频率：
+     * 请求 40MHz 但卡不支持 HS 时，IDF 会降到 20MHz，这里必须记实际值，
+     * 否则 UI/日志会误以为跑在 40MHz。极少数路径该字段为 0，回退到请求值。 */
+    int real_khz = card->real_freq_khz > 0 ? card->real_freq_khz : freq_khz;
+    g_sdcard.freq_khz       = real_khz;
     g_sdcard.sector_count   = card->csd.capacity;
     g_sdcard.capacity_bytes = ((uint64_t)card->csd.capacity) * card->csd.sector_size;
     /* cid.name 是 char[8]，可能没有结尾的 '\0'，用 %.8s 限制长度避免读越界 */
     snprintf(g_sdcard.card_name, sizeof(g_sdcard.card_name), "%.8s", (const char *)card->cid.name);
 
-    ESP_LOGI(TAG, "已挂载 %s: %s, %d 线 %d kHz, %llu MB, %u 扇区",
-             SD_MOUNT_POINT, g_sdcard.card_name, width, freq_khz,
+    ESP_LOGI(TAG, "已挂载 %s: %s, %d 线 请求%d kHz / 实际%d kHz, %llu MB, %u 扇区",
+             SD_MOUNT_POINT, g_sdcard.card_name, width, freq_khz, real_khz,
              (unsigned long long)(g_sdcard.capacity_bytes / (1024 * 1024)),
              (unsigned)g_sdcard.sector_count);
+    if (real_khz < freq_khz) {
+        ESP_LOGW(TAG, "卡未跑满请求时钟：%d → %d kHz（卡不支持 HS 或驱动降级）", freq_khz, real_khz);
+    }
     return ESP_OK;
 }
 
@@ -109,23 +116,25 @@ static esp_err_t mount_with_retry(int width, int freq_khz)
 }
 
 /* 挂载尝试顺序（(宽度, 时钟)）：
- *   1) 4 线 10MHz   —— 最快
- *   2) 4 线 4MHz    —— ESP32-S3 的 SDMMC 全部走 GPIO 矩阵，没有 IO MUX 专用脚，
- *                      D0~D3 的走线延时不一致时 4 线会 CRC 失败（err 0x109），
- *                      降速通常就能过（驱动也会打印 input line delay not supported）
- *   3) 1 线 10MHz   —— 只留 D0，速度慢但对走线最宽容
+ *   1) 1 线 40MHz   —— 本次试验主档：只留 D0 避开 D1~D3 走线不等长问题，
+ *                      同时把时钟拉到 SD High Speed 上限（SDMMC_FREQ_HIGHSPEED）。
+ *                      注意：卡不支持 HS 时驱动会自行降到 20MHz，看日志的「实际」值。
+ *   2) 1 线 4MHz    —— 40MHz 在 GPIO 矩阵 + 内部上拉下容易 CRC/超时，回退保底
+ *   3) 4 线 4MHz    —— 4 线降速重试
+ *   4) 4 线 40MHz   —— 4 线高速（卡座信号好时使用）
  */
 typedef struct { int width; int freq_khz; } sd_try_t;
 static const sd_try_t s_try_list[] = {
-    { 1, 4000 },            /* 最稳优先：1 线 4MHz，绕开 D1~D3 走线不等长/上拉不足 */
+    { 1, SD_FREQ_KHZ },     /* 1 线 40MHz */
+    { 1, 4000 },            /* 40MHz 不稳时回退 1 线 4MHz */
     { 4, 4000 },            /* 4 线降速重试 */
-    { 4, SD_FREQ_KHZ },     /* 4 线原速（卡座信号好时使用） */
+    { 4, SD_FREQ_KHZ },     /* 4 线 40MHz */
 };
 
 /* 4 线全部失败后的「体检」：用 400kHz（SD 初始化速率，几乎不受走线影响）探一次。
  *   成功 → D1~D3 是接通的，只是高速下信号质量差（缺 10k 上拉 / 走线不等长）；
  *   失败 → D1/D2/D3(GPIO48/1/2) 大概率没接或接错，只能一直用 1 线。
- * 探测成功后立刻卸载，不留在 400kHz（比 1 线 10MHz 还慢得多）。 */
+ * 探测成功后立刻卸载，不留在 400kHz（比 1 线 40MHz 慢得多）。 */
 static void probe_4bit_lowspeed(void)
 {
     if (mount_with_width(4, SDMMC_FREQ_PROBING) == ESP_OK) {
