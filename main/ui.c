@@ -202,6 +202,7 @@ static lv_obj_t *g_wifi_screen = NULL;
 static lv_obj_t *g_ble_screen = NULL;
 static lv_obj_t *g_settings_screen = NULL;
 static lv_obj_t *g_clock_screen = NULL;
+static lv_obj_t *g_timer_screen = NULL;
 static lv_obj_t *g_alarm_screen = NULL;
 static lv_obj_t *g_music_screen = NULL;
 static lv_obj_t *g_files_screen = NULL;   /* 文件管理 */
@@ -265,6 +266,9 @@ static int g_pending_app = -1;
 static app_id_t g_active_app = APP_NONE;
 /* 系统信息屏 1s 刷新定时器（仅在“关于本机”屏可见时才运行，避免无谓刷新不可见标签） */
 static lv_timer_t *g_sysinfo_timer = NULL;
+/* 前向声明：计时器 构建函数与每帧更新（定义见文件后部） */
+static void build_timer_screen(lv_obj_t *parent);
+static void ui_timer_update(void);
 
 /* 触摸相关：FT6336 实时坐标 + 屏幕上的红色指示点 */
 static lv_obj_t      *g_red_dot = NULL;
@@ -994,6 +998,51 @@ static lv_obj_t *make_app_button(lv_obj_t *parent, const lv_image_dsc_t *app_ico
     return btn;
 }
 
+/* 无位图图标时，用单个汉字字形当图标（项目里 10 个 A8 图标已被首页用满，
+ * 计时器这类暂无位图图标的 App 用「时」做极简图标，避免复用导致重复） */
+static lv_obj_t *make_app_button_glyph(lv_obj_t *parent, const char *glyph, const char *name,
+                                      lv_color_t color, int app_id)
+{
+    lv_obj_t *btn = lv_button_create(parent);
+    lv_obj_set_size(btn, 88, 88);
+    lv_obj_set_style_bg_opa(btn, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_shadow_opa(btn, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_opa(btn, LV_OPA_TRANSP, 0);
+    lv_obj_set_flex_flow(btn, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(btn, 8, 0);
+    lv_obj_set_style_bg_color(btn, lv_color_hex(0x1A1A24), LV_STATE_PRESSED);
+
+    lv_obj_t *icon = lv_obj_create(btn);
+    lv_obj_set_size(icon, 52, 52);
+    lv_obj_set_style_bg_color(icon, color, 0);
+    lv_obj_set_style_radius(icon, 14, 0);
+    lv_obj_set_style_border_opa(icon, LV_OPA_TRANSP, 0);
+    lv_obj_clear_flag(icon, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(icon, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_clear_flag(icon, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_t *g = lv_label_create(icon);
+    lv_label_set_text(g, glyph);
+    lv_obj_set_style_text_color(g, lv_color_white(), 0);
+    lv_obj_set_style_text_font(g, &lv_font_cn_16, 0);
+    lv_obj_clear_flag(g, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(g, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_clear_flag(g, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_center(g);
+
+    lv_obj_t *nm = lv_label_create(btn);
+    lv_label_set_text(nm, name);
+    lv_obj_set_style_text_color(nm, lv_color_white(), 0);
+    lv_obj_set_style_text_font(nm, &lv_font_cn_16, 0);
+    lv_obj_clear_flag(nm, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(nm, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_clear_flag(nm, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_scrollbar_mode(btn, LV_SCROLLBAR_MODE_OFF);
+
+    lv_obj_add_event_cb(btn, open_screen_cb, LV_EVENT_CLICKED, (void *)(intptr_t)app_id);
+    return btn;
+}
+
 /* 预渲染后的主界面壁纸: 把"壁纸 × 50% + 底色 0x0B0B12"预先 CPU 混合,
  * 运行时 LVGL 只 blit 这个 buffer(opa=COVER, 无 alpha 混合), 滑动 FPS 40→60+。
  * 一次性 CPU 混合 153KB, 初始化 ~30ms, 可接受。 */
@@ -1074,26 +1123,28 @@ static void build_home(void)
     lv_obj_set_scrollbar_mode(g_home, LV_SCROLLBAR_MODE_AUTO);
     /* 状态栏由 lvgl_ui_bootstrap 在 lv_layer_top() 上统一创建，不随 g_home 滚动 */
 
-    struct { const lv_image_dsc_t *icon; const char *name; lv_color_t color; int id; } apps[10] = {
-        { &ico_wifi,     "无线", lv_color_hex(0x2E7DE0), APP_WIFI },
-        { &ico_bluetooth, "蓝牙", lv_color_hex(0x0082FC), APP_BLE },
-        { &ico_settings, "设置", lv_color_hex(0x6B7280), APP_SETTINGS },
-        { &ico_clock,    "时钟", lv_color_hex(0x9C5FFF), APP_CLOCK },
-        { &ico_music,    "音乐", lv_color_hex(0xE0457B), APP_MUSIC },
-        { &ico_game,     "游戏", lv_color_hex(0x2BB673), APP_GAME },
-        { &ico_weather,  "天气", lv_color_hex(0xE08A2B), APP_WEATHER },
-        { &ico_novel,    "小说", lv_color_hex(0xD4A24C), APP_NOVEL },
-        { &ico_pcmon,    "监控", lv_color_hex(0x2EC4B6), APP_PCMON },
-        { &ico_files,    "文件", lv_color_hex(0xF2A33C), APP_FILES },
+    struct { const lv_image_dsc_t *icon; const char *name; lv_color_t color; int id; const char *glyph; } apps[11] = {
+        { &ico_wifi,     "无线", lv_color_hex(0x2E7DE0), APP_WIFI,     NULL },
+        { &ico_bluetooth,"蓝牙", lv_color_hex(0x0082FC), APP_BLE,      NULL },
+        { &ico_settings, "设置", lv_color_hex(0x6B7280), APP_SETTINGS, NULL },
+        { &ico_clock,    "时钟", lv_color_hex(0x9C5FFF), APP_CLOCK,    NULL },
+        { &ico_music,    "音乐", lv_color_hex(0xE0457B), APP_MUSIC,    NULL },
+        { &ico_game,     "游戏", lv_color_hex(0x2BB673), APP_GAME,     NULL },
+        { &ico_weather,  "天气", lv_color_hex(0xE08A2B), APP_WEATHER,  NULL },
+        { &ico_novel,    "小说", lv_color_hex(0xD4A24C), APP_NOVEL,    NULL },
+        { &ico_pcmon,    "监控", lv_color_hex(0x2EC4B6), APP_PCMON,    NULL },
+        { &ico_files,    "文件", lv_color_hex(0xF2A33C), APP_FILES,    NULL },
+        { &ico_clock,    "计时器", lv_color_hex(0x5B8DEF), APP_TIMER,   "时" },
     };
-    /* 横屏 320×240：3 列 × 4 行，第 3、4 行超出屏幕，靠竖直滚动翻到。
-     *   列 x = 20 / 120 / 220（按钮宽 88 → 最右边缘 308 < 320）
-     *   行 y = 38 / 146 / 254 / 362（按钮高 88，第 3 行起需下滑） */
+    /* 横屏 320×240：3 列 × 4 行。第 4 行靠竖直滚动翻到。 */
     const int start_x = 20, start_y = 38;
-    const int gap_x = 100, gap_y = 108;   // 3 列 × 3 行
+    const int gap_x = 100, gap_y = 108;   // 3 列 × 4 行
     for (int i = 0; i < (int)(sizeof(apps) / sizeof(apps[0])); i++) {
-        lv_obj_t *btn = make_app_button(g_home, apps[i].icon, apps[i].name,
-                                        apps[i].color, apps[i].id);
+        lv_obj_t *btn;
+        if (apps[i].glyph)
+            btn = make_app_button_glyph(g_home, apps[i].glyph, apps[i].name, apps[i].color, apps[i].id);
+        else
+            btn = make_app_button(g_home, apps[i].icon, apps[i].name, apps[i].color, apps[i].id);
         int col = i % 3;
         int row = i / 3;
         lv_obj_set_pos(btn, start_x + col * gap_x, start_y + row * gap_y);
@@ -3676,6 +3727,268 @@ static void build_sysinfo_screen(lv_obj_t *scr)
     sysinfo_timer_cb(g_sysinfo_timer);   /* 进界面立即刷一次 */
 }
 
+
+
+/* ================= 计时器（秒表 / 倒计时） ================= */
+typedef enum { TM_STOP, TM_RUN, TM_PAUSE } tm_state_t;
+static int        tm_mode = 0;        /* 0 秒表, 1 倒计时 */
+static tm_state_t tm_state = TM_STOP;
+static int64_t    tm_acc_us = 0;      /* 秒表:已计; 倒计时:剩余 */
+static int64_t    tm_start_us = 0;
+static int        tm_set_sec = 300;   /* 倒计时默认 5 分钟 */
+static int        tm_lap = 0;
+static lv_obj_t  *g_tm_disp = NULL;
+static lv_obj_t  *g_tm_info = NULL;
+static lv_obj_t  *g_tm_lap_box = NULL;   /* 计次列表滚动容器，固定高度，避免计次过多挤掉时间和按钮 */
+static lv_obj_t  *g_tm_set_row = NULL;   /* 倒计时设定按钮行（分/秒 ±1/±10） */
+static lv_obj_t  *g_tm_lap_btn = NULL;   /* 控制行的「计次」按钮，倒计时模式隐藏 */
+static lv_obj_t  *g_tm_btnA_lbl = NULL;
+static lv_obj_t  *g_tm_btnC_lbl = NULL;
+static lv_obj_t  *g_tm_mode_btn[2] = { NULL, NULL };
+
+static void tm_fmt(int64_t us, char *buf)
+{
+    if (us < 0) us = 0;
+    int ms = (int)((us / 10000) % 100);
+    int s  = (int)((us / 1000000) % 60);
+    int m  = (int)(us / 60000000);
+    snprintf(buf, 32, "%02d:%02d.%02d", m, s, ms);
+}
+static int64_t tm_current(void)
+{
+    if (tm_state != TM_RUN) return tm_acc_us;
+    int64_t d = esp_timer_get_time() - tm_start_us;
+    return (tm_mode == 0) ? (tm_acc_us + d) : (tm_acc_us - d);
+}
+static void tm_refresh(void)
+{
+    char buf[32];
+    if (tm_mode == 1 && tm_state == TM_STOP) {
+        /* 倒计时待机：显示设定值，不带百分秒，更清爽 */
+        snprintf(buf, sizeof(buf), "%02d:%02d", (int)(tm_set_sec / 60), (int)(tm_set_sec % 60));
+    } else {
+        tm_fmt(tm_current(), buf);
+    }
+    lv_label_set_text(g_tm_disp, buf);
+}
+static void tm_adj_set(int delta)
+{
+    if (tm_state != TM_STOP) return;            /* 仅待机时可改设定，运行中禁止 */
+    tm_set_sec += delta;
+    if (tm_set_sec < 0) tm_set_sec = 0;
+    if (tm_set_sec > 5999) tm_set_sec = 5999;   /* 最长 99:59 */
+    tm_acc_us = (int64_t)tm_set_sec * 1000000;
+    tm_refresh();
+}
+static void tm_apply_visibility(void)
+{
+    bool sw = (tm_mode == 0);
+    if (sw) lv_obj_clear_flag(g_tm_lap_box, LV_OBJ_FLAG_HIDDEN);
+    else    lv_obj_add_flag(g_tm_lap_box, LV_OBJ_FLAG_HIDDEN);
+    if (sw) lv_obj_clear_flag(g_tm_lap_btn, LV_OBJ_FLAG_HIDDEN);
+    else    lv_obj_add_flag(g_tm_lap_btn, LV_OBJ_FLAG_HIDDEN);
+    bool cd_idle = (tm_mode == 1 && tm_state == TM_STOP);
+    if (cd_idle) lv_obj_clear_flag(g_tm_set_row, LV_OBJ_FLAG_HIDDEN);
+    else         lv_obj_add_flag(g_tm_set_row, LV_OBJ_FLAG_HIDDEN);
+}
+static void tm_set_cb(lv_event_t *e)
+{
+    int d = (int)(intptr_t)lv_event_get_user_data(e);
+    tm_adj_set(d);
+}
+static void tm_set_mode(int m)
+{
+    tm_mode = m; tm_state = TM_STOP; tm_lap = 0;
+    tm_acc_us = (m == 1) ? (int64_t)tm_set_sec * 1000000 : 0;
+    /* 激活的模式高亮（绿色），未激活置灰 */
+    lv_obj_set_style_bg_color(g_tm_mode_btn[0], m == 0 ? lv_color_hex(0x2BB673) : lv_color_hex(0x2A2A33), 0);
+    lv_obj_set_style_bg_color(g_tm_mode_btn[1], m == 1 ? lv_color_hex(0x2BB673) : lv_color_hex(0x2A2A33), 0);
+    lv_label_set_text(g_tm_btnC_lbl, m == 0 ? "计次" : "+1:00");
+    lv_label_set_text(g_tm_btnA_lbl, "开始");
+    lv_obj_set_style_bg_color(lv_obj_get_parent(g_tm_btnA_lbl), lv_color_hex(0x2BB673), 0);
+    lv_label_set_text(g_tm_info, m == 1 ? "设定 05:00" : "（计次记录显示在此）");
+    tm_apply_visibility();
+    tm_refresh();
+}
+static void tm_btnA_cb(lv_event_t *e)
+{
+    (void)e;
+    lv_obj_t *btn = lv_obj_get_parent(g_tm_btnA_lbl);
+    if (tm_state == TM_RUN) {
+        tm_acc_us = tm_current(); tm_state = TM_PAUSE;
+        lv_label_set_text(g_tm_btnA_lbl, "继续");
+        lv_obj_set_style_bg_color(btn, lv_color_hex(0xE08A2B), 0);   /* 暂停：橙 */
+    } else {
+        tm_start_us = esp_timer_get_time(); tm_state = TM_RUN;
+        lv_label_set_text(g_tm_btnA_lbl, "暂停");
+        lv_obj_set_style_bg_color(btn, lv_color_hex(0xE0457B), 0);   /* 运行中：粉 */
+    }
+    tm_apply_visibility();
+}
+static void tm_btnB_cb(lv_event_t *e)
+{
+    (void)e;
+    tm_state = TM_STOP;
+    tm_acc_us = (tm_mode == 1) ? (int64_t)tm_set_sec * 1000000 : 0;
+    tm_lap = 0;
+    lv_label_set_text(g_tm_btnA_lbl, "开始");
+    lv_obj_set_style_bg_color(lv_obj_get_parent(g_tm_btnA_lbl), lv_color_hex(0x2BB673), 0);
+    lv_label_set_text(g_tm_info, tm_mode == 1 ? "设定 05:00" : "");
+    tm_apply_visibility();
+    tm_refresh();
+}
+static void tm_btnC_cb(lv_event_t *e)
+{
+    (void)e;
+    if (tm_mode != 0) return;                /* 仅秒表计次；倒计时用设定按钮 */
+    if (tm_state != TM_RUN || tm_lap >= 8) return;
+    tm_lap++;
+    char t[16]; tm_fmt(tm_current(), t);
+    const char *old = lv_label_get_text(g_tm_info);
+    char nw[160];
+    snprintf(nw, sizeof(nw), "%s\n#%d %s", old, tm_lap, t);
+    lv_label_set_text(g_tm_info, nw);
+    lv_obj_scroll_to_y(g_tm_lap_box, LV_COORD_MAX, LV_ANIM_OFF);   /* 始终显示最新计次 */
+}
+static void tm_mode_cb(lv_event_t *e)
+{
+    int m = (int)(intptr_t)lv_event_get_user_data(e);
+    tm_set_mode(m);
+}
+static void ui_timer_update(void)
+{
+    if (tm_state != TM_RUN) return;
+    int64_t cur = tm_current();
+    if (tm_mode == 1 && cur <= 0) {
+        tm_acc_us = 0; tm_state = TM_STOP;
+        lv_label_set_text(g_tm_disp, "时间到！");
+        lv_label_set_text(g_tm_btnA_lbl, "开始");
+        lv_obj_set_style_bg_color(lv_obj_get_parent(g_tm_btnA_lbl), lv_color_hex(0x2BB673), 0);
+        tm_apply_visibility();   /* 重新显示设定按钮 */
+        return;
+    }
+    tm_refresh();
+}
+static void build_timer_screen(lv_obj_t *parent)
+{
+    lv_obj_t *cont = lv_obj_create(parent);
+    lv_obj_set_size(cont, LCD_W, LCD_H - 66);
+    lv_obj_align(cont, LV_ALIGN_TOP_LEFT, 0, 66);
+    lv_obj_set_style_bg_opa(cont, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_opa(cont, LV_OPA_TRANSP, 0);
+    lv_obj_set_flex_flow(cont, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(cont, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_all(cont, 4, 0);
+    lv_obj_set_style_pad_row(cont, 4, 0);
+    lv_obj_clear_flag(cont, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(cont, LV_SCROLLBAR_MODE_OFF);
+
+    /* 模式切换：两段式分段控件，激活态在 tm_set_mode 里高亮 */
+    lv_obj_t *modes = lv_obj_create(cont);
+    lv_obj_set_size(modes, LCD_W - 20, 28);
+    lv_obj_set_style_bg_opa(modes, LV_OPA_TRANSP, 0); lv_obj_set_style_border_opa(modes, LV_OPA_TRANSP, 0);
+    lv_obj_set_flex_flow(modes, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(modes, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(modes, 8, 0);
+    lv_obj_clear_flag(modes, LV_OBJ_FLAG_SCROLLABLE); lv_obj_set_scrollbar_mode(modes, LV_SCROLLBAR_MODE_OFF);
+    static const char *mname[2] = { "秒表", "倒计时" };
+    for (int i = 0; i < 2; i++) {
+        g_tm_mode_btn[i] = lv_button_create(modes);
+        lv_obj_set_size(g_tm_mode_btn[i], (LCD_W - 20 - 8) / 2, 30);
+        lv_obj_set_style_bg_color(g_tm_mode_btn[i], lv_color_hex(0x2A2A33), 0);
+        lv_obj_t *l = lv_label_create(g_tm_mode_btn[i]);
+        lv_label_set_text(l, mname[i]);
+        lv_obj_set_style_text_font(l, &lv_font_cn_16, 0); lv_obj_center(l);
+        lv_obj_add_event_cb(g_tm_mode_btn[i], tm_mode_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+    }
+
+    /* 大号时间显示，居中 */
+    g_tm_disp = lv_label_create(cont);
+    lv_obj_set_style_text_font(g_tm_disp, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(g_tm_disp, lv_color_white(), 0);
+    lv_obj_set_width(g_tm_disp, LCD_W - 16);
+    lv_obj_set_style_text_align(g_tm_disp, LV_TEXT_ALIGN_CENTER, 0);
+
+    /* 倒计时设定按钮行：分/秒各 ±1、±10，可组合出任意 MM:SS；仅倒计时待机时显示 */
+    lv_obj_t *set_row = lv_obj_create(cont);
+    lv_obj_set_size(set_row, LCD_W - 20, 50);
+    lv_obj_set_style_bg_opa(set_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_opa(set_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_flex_flow(set_row, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(set_row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_set_style_pad_all(set_row, 2, 0);
+    lv_obj_set_style_pad_column(set_row, 4, 0);
+    lv_obj_set_style_pad_row(set_row, 4, 0);
+    lv_obj_set_flex_grow(set_row, 1);
+    lv_obj_add_flag(set_row, LV_OBJ_FLAG_HIDDEN);   /* 默认隐藏，由 tm_apply_visibility 控制 */
+    lv_obj_clear_flag(set_row, LV_OBJ_FLAG_SCROLLABLE); lv_obj_set_scrollbar_mode(set_row, LV_SCROLLBAR_MODE_OFF);
+
+    static const struct { const char *t; int d; } steps[8] = {
+        { "-10分", -600 }, { "-1分", -60 }, { "+1分", +60 }, { "+10分", +600 },
+        { "-10秒", -10  }, { "-1秒", -1  }, { "+1秒", +1  }, { "+10秒", +10  },
+    };
+    for (int i = 0; i < 8; i++) {
+        lv_obj_t *sb = lv_button_create(set_row);
+        lv_obj_set_size(sb, (LCD_W - 20 - 2 * 2 - 3 * 4) / 4, 22);
+        lv_obj_set_style_bg_color(sb, lv_color_hex(0x2A2A33), 0);
+        lv_obj_t *sl = lv_label_create(sb); lv_label_set_text(sl, steps[i].t);
+        lv_obj_set_style_text_font(sl, &lv_font_cn_16, 0); lv_obj_center(sl);
+        lv_obj_add_event_cb(sb, tm_set_cb, LV_EVENT_CLICKED, (void *)(intptr_t)steps[i].d);
+    }
+    g_tm_set_row = set_row;
+
+    /* 计次列表：占据中间较大的可滚动区域，按钮固定在最底部，避免滑动时误触。
+       向下滑查看较早的计次，计次后自动定位到最新一条。 */
+    lv_obj_t *lap_box = lv_obj_create(cont);
+    lv_obj_set_size(lap_box, LCD_W - 20, 50);
+    lv_obj_set_style_bg_color(lap_box, lv_color_hex(0x16161F), 0);
+    lv_obj_set_style_radius(lap_box, 6, 0);
+    lv_obj_set_style_border_opa(lap_box, LV_OPA_TRANSP, 0);
+    lv_obj_set_flex_flow(lap_box, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(lap_box, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_set_style_pad_all(lap_box, 4, 0);
+    lv_obj_set_style_pad_row(lap_box, 2, 0);
+    lv_obj_set_flex_grow(lap_box, 1);          /* 占据剩余空间，自身固定、不挤压上方控件 */
+    lv_obj_set_scroll_dir(lap_box, LV_DIR_VER);   /* 仅竖直滚动，避免横向误触 */
+    lv_obj_set_scrollbar_mode(lap_box, LV_SCROLLBAR_MODE_AUTO);
+
+    g_tm_lap_box = lap_box;
+    g_tm_info = lv_label_create(lap_box);
+    lv_obj_set_style_text_font(g_tm_info, &lv_font_cn_16, 0);
+    lv_obj_set_style_text_color(g_tm_info, lv_color_hex(0x9AA0B5), 0);
+    lv_obj_set_width(g_tm_info, LCD_W - 28);
+    lv_obj_set_style_text_align(g_tm_info, LV_TEXT_ALIGN_LEFT, 0);
+    lv_obj_set_style_pad_left(g_tm_info, 2, 0);
+
+    /* 控制按钮行：固定在最底部 */
+    lv_obj_t *row = lv_obj_create(cont);
+    lv_obj_set_size(row, LCD_W - 20, 36);
+    lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0); lv_obj_set_style_border_opa(row, LV_OPA_TRANSP, 0);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(row, 8, 0);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE); lv_obj_set_scrollbar_mode(row, LV_SCROLLBAR_MODE_OFF);
+
+    lv_obj_t *bA = lv_button_create(row); lv_obj_set_size(bA, (LCD_W - 20 - 16) / 3, 36);
+    lv_obj_set_style_bg_color(bA, lv_color_hex(0x2BB673), 0);
+    g_tm_btnA_lbl = lv_label_create(bA); lv_label_set_text(g_tm_btnA_lbl, "开始");
+    lv_obj_set_style_text_font(g_tm_btnA_lbl, &lv_font_cn_16, 0); lv_obj_center(g_tm_btnA_lbl);
+    lv_obj_add_event_cb(bA, tm_btnA_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *bB = lv_button_create(row); lv_obj_set_size(bB, (LCD_W - 20 - 16) / 3, 36);
+    lv_obj_t *bB_l = lv_label_create(bB); lv_label_set_text(bB_l, "复位");
+    lv_obj_set_style_text_font(bB_l, &lv_font_cn_16, 0); lv_obj_center(bB_l);
+    lv_obj_add_event_cb(bB, tm_btnB_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *bC = lv_button_create(row); lv_obj_set_size(bC, (LCD_W - 20 - 16) / 3, 36);
+    g_tm_btnC_lbl = lv_label_create(bC); lv_label_set_text(g_tm_btnC_lbl, "计次");
+    lv_obj_set_style_text_font(g_tm_btnC_lbl, &lv_font_cn_16, 0); lv_obj_center(g_tm_btnC_lbl);
+    lv_obj_add_event_cb(bC, tm_btnC_cb, LV_EVENT_CLICKED, NULL);
+    g_tm_lap_btn = bC;
+
+    tm_set_mode(0);
+}
+
 #if UI_MEM_DEBUG
 static const char *app_id_name(int id)
 {
@@ -3692,6 +4005,7 @@ static const char *app_id_name(int id)
     case APP_BLE:      return "蓝牙";
     case APP_FILES:    return "文件";
     case APP_SYSINFO:  return "系统";
+    case APP_TIMER:    return "计时器";
     default:           return "?";
     }
 }
@@ -3817,6 +4131,10 @@ static void ui_handle_pending_app(void)
             build_sysinfo_screen(g_sysinfo_screen);
         }
         scr = g_sysinfo_screen;
+        break;
+    case APP_TIMER:
+        if (!g_timer_screen) { g_timer_screen = make_app_screen("计时器"); build_timer_screen(g_timer_screen); }
+        scr = g_timer_screen;
         break;
     default:
         break;
@@ -4060,6 +4378,7 @@ static void lvgl_task(void *arg)
         if (g_active_app == APP_WIFI)  ui_refresh_wifi_list();
         if (g_active_app == APP_BLE)   ui_refresh_ble_list();
         if (g_active_app == APP_GAME)  snake_update();
+        if (g_active_app == APP_TIMER) ui_timer_update();
 
         /* 延迟任务：密码面板、App 跳转 */
         ui_handle_pending_password();
