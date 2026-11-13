@@ -39,3 +39,8 @@ void ui_go_home(void);
 /* 隐藏/恢复顶部系统状态栏 (layer_top 上的统一实例)。
  * 供贪吃蛇等需要全屏的游戏界面临时隐藏。 */
 void ui_set_status_bar_visible(bool vis);
+
+/* 从其它模块（文件管理器）请求：切到音乐屏并立即播放指定 WAV。
+ * 只置位延迟跳转，真正建屏/播放在主循环的 ui_handle_pending_app 里做，
+ * 避免在输入事件回调里重入建大量 LVGL 对象。 */
+void ui_open_music_and_play(const char *path);

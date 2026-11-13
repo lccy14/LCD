@@ -26,6 +26,7 @@
 #include "file_mgr.h"         /* 文件管理（SD 卡 / SDMMC + FATFS） */
 #include "sd_card.h"          /* SD_MOUNT_POINT / sd_card_mount / sd_card_is_mounted，小说扫 SD 卡电子书 */
 #include "media.h"            /* 图片查看（JPG/PNG/BMP） */
+#include "audio_player.h"     /* I2S → MAX98357A 真实播放 */
 #include <dirent.h>           /* 音乐：扫描 SD 卡音频文件（opendir/readdir） */
 #include <strings.h>          /* strcasecmp，音乐扩展名判断 */
 #include <sys/stat.h>         /* stat，估算音频时长 */
@@ -1905,12 +1906,12 @@ static void wx_refresh_cb(lv_event_t *e)
     ui_weather_refresh_if_needed(true);   /* 手动刷新：强制拉一次 */
 }
 
-/* ===================== 音乐播放（伪实现） =====================
- * 需求：能从 SD 卡读到音频文件、能「播放」、有进度。
- * 伪实现：扫描 /sdcard 下的音频文件，点列表即选曲；用定时器按真实时间推进进度条，
- *         到尾自动下一首。不解码、不占用任何音频引脚、不真正出声。
- * TODO（引脚确定后）：在 music_play() 里初始化 MP3 解码器，并把 music_timer_cb 里
- *       的「定时器伪推进」改成「读一帧 PCM → 经 I2S 送到 DAC/功放」，即可真正出声。
+/* ===================== 音乐播放 =====================
+ * SD 卡 WAV(PCM) / MP3(minimp3) → audio_player → I2S → MAX98357A 真正出声。
+ * UI 只发命令、按 g_audio.version 轮询刷新，不碰 I2S，也不需要 LVGL 锁。
+ * 进度由实际解码/送出的数据推进，与真实播放速度天然一致；播完自动下一首。
+ * 支持的扩展名由 audio_player_supported() 统一决定（当前 .wav / .mp3），
+ * FLAC/OGG/AAC 等不支持的格式在扫描时会被过滤掉。
  * ============================================================== */
 #define MUSIC_MAX_FILES   64
 #define MUSIC_DIR         "/sdcard"
@@ -1918,11 +1919,10 @@ static void wx_refresh_cb(lv_event_t *e)
 static char       g_music_files[MUSIC_MAX_FILES][384];
 static int        g_music_count = 0;
 static int        g_music_cur   = -1;
-static int        g_music_pos   = 0;     /* 已播放毫秒（伪） */
-static int        g_music_dur   = 0;     /* 曲目总时长（秒，估算） */
-static bool       g_music_playing = false;
-static uint32_t   g_music_tick = 0;      /* 上次推进时的 lv_tick（ms） */
+static uint32_t   s_music_shown_ver = 0;   /* 上次刷新过的 g_audio.version */
 static lv_timer_t *s_music_timer = NULL;
+static char       s_music_pending_path[384];  /* 文件管理器请求播放的路径 */
+static bool       s_music_pending = false;
 
 static lv_obj_t  *g_music_title  = NULL;
 static lv_obj_t  *g_music_slider = NULL;
@@ -1930,6 +1930,7 @@ static lv_obj_t  *g_music_time   = NULL;
 static lv_obj_t  *g_music_time_r = NULL;   /* 进度条右侧：总时长 */
 static lv_obj_t  *g_music_play_btn = NULL;
 static lv_obj_t  *g_music_play_lbl = NULL;
+static lv_obj_t  *g_music_vol_slider = NULL;
 
 static const char *music_base(const char *p)
 {
@@ -1937,24 +1938,17 @@ static const char *music_base(const char *p)
     return s ? s + 1 : p;
 }
 
-static bool music_is_audio(const char *name)
-{
-    size_t n = strlen(name);
-    if (n < 4) return false;
-    const char *e = name + n - 4;
-    return strcasecmp(e, ".mp3") == 0 || strcasecmp(e, ".wav") == 0 ||
-           strcasecmp(e, ".flac") == 0 || strcasecmp(e, ".ogg") == 0;
-}
-
-/* 扫描 SD 卡根目录的音频文件 */
+/* 扫描 SD 卡根目录，只收当前解码器能播的文件（PCM WAV）。
+ * 时长不再估算 —— 由 audio_player 从 WAV 头精确计算。 */
 static void music_scan(void)
 {
     g_music_count = 0;
+    g_music_cur   = -1;
     DIR *d = opendir(MUSIC_DIR);
     if (!d) return;
     struct dirent *ent;
     while ((ent = readdir(d)) != NULL && g_music_count < MUSIC_MAX_FILES) {
-        if (!music_is_audio(ent->d_name)) continue;
+        if (!audio_player_supported(ent->d_name)) continue;
         snprintf(g_music_files[g_music_count], sizeof(g_music_files[0]),
                  "%s/%s", MUSIC_DIR, ent->d_name);
         g_music_count++;
@@ -1962,85 +1956,50 @@ static void music_scan(void)
     closedir(d);
 }
 
-/* 估算时长（秒）：尝试解析 MP3 第一帧得到比特率/采样率；失败按 ~128kbps 回退 */
-static int music_estimate_duration(const char *path)
+/* 把后台任务的提示文本拷到普通缓冲（g_audio.hint 是 volatile char[]，
+ * 直接传给 LVGL 会有 volatile 限定符问题，且可能读到写一半的内容） */
+static void music_copy_hint(char *dst, size_t cap)
 {
-    struct stat st;
-    if (stat(path, &st) != 0 || st.st_size <= 0) return 0;
-    long size = st.st_size;
-    FILE *f = fopen(path, "rb");
-    if (!f) return (int)(size / 16000);
-
-    int dur = 0;
-    unsigned char h[4];
-    /* 跳过 ID3v2 标签头（前 3 字节 "ID3"，后跟 7 字节长度） */
-    if (fread(h, 1, 3, f) == 3 && h[0] == 'I' && h[1] == 'D' && h[2] == 'D') {
-        unsigned char b[7];
-        if (fread(b, 1, 7, f) == 7) {
-            long len = ((long)b[2] << 21) | ((long)b[3] << 14) |
-                       ((long)b[4] << 7)  |  b[5];
-            fseek(f, 10 + len, SEEK_SET);
-        }
-    } else {
-        fseek(f, 0, SEEK_SET);
-    }
-    /* 在前 64KB 内定位第一个 MP3 帧同步字 0xFF 0xEx/Fx */
-    long scanned = 0;
-    while (scanned < 65536 && fread(h, 1, 4, f) == 4) {
-        if (h[0] == 0xFF && (h[1] & 0xE0) == 0xE0) {
-            int bi = (h[2] >> 4) & 0xF;   /* 比特率索引 */
-            int si = (h[2] >> 2) & 0x3;   /* 采样率索引 */
-            static const int br[16] = {0,32,40,48,56,64,80,96,112,128,160,192,224,256,320,0};
-            static const int sr[4]  = {44100,48000,32000,0};
-            int bitrate = br[bi], samplerate = sr[si];
-            if (bitrate > 0 && samplerate > 0) {
-                /* MPEG1 Layer III 帧大小（字节）与每帧样本数（1152） */
-                long frame = (144L * bitrate * 1000) / samplerate;
-                long off   = ftell(f) - 4;
-                long frames = (size - off) / frame;
-                if (frames > 0) dur = (int)(frames * 1152 / samplerate);
-                break;
-            }
-        }
-        fseek(f, -3, SEEK_CUR);
-        scanned++;
-    }
-    fclose(f);
-    if (dur <= 0) dur = (int)(size / 16000);   /* 回退：~128kbps */
-    return dur;
+    size_t i = 0;
+    for (; i + 1 < cap && g_audio.hint[i]; i++) dst[i] = g_audio.hint[i];
+    dst[i] = '\0';
 }
 
 static void music_update_time(void)
 {
-    int s = g_music_pos / 1000;
+    uint32_t pos_s = g_audio.pos_ms / 1000;
+    uint32_t dur_s = g_audio.dur_ms / 1000;
     char b1[16], b2[16];
-    snprintf(b1, sizeof(b1), "%d:%02d", s / 60, s % 60);
-    snprintf(b2, sizeof(b2), "%d:%02d", g_music_dur / 60, g_music_dur % 60);
+    snprintf(b1, sizeof(b1), "%u:%02u", (unsigned)(pos_s / 60), (unsigned)(pos_s % 60));
+    snprintf(b2, sizeof(b2), "%u:%02u", (unsigned)(dur_s / 60), (unsigned)(dur_s % 60));
     lv_label_set_text(g_music_time, b1);     /* 左侧：当前 */
     lv_label_set_text(g_music_time_r, b2);   /* 右侧：总时长 */
 }
 
 static void music_update_title(void)
 {
-    if (g_music_cur >= 0)
+    char hint[40];
+    music_copy_hint(hint, sizeof(hint));
+    if (hint[0]) {
+        lv_label_set_text(g_music_title, hint);           /* 错误/格式提示优先 */
+    } else if (g_music_cur >= 0) {
         lv_label_set_text(g_music_title, music_base(g_music_files[g_music_cur]));
+    } else {
+        lv_label_set_text(g_music_title, g_music_count > 0 ? "未播放" : "请放入 WAV/MP3");
+    }
 }
 
 static void music_play(int idx)
 {
     if (idx < 0 || idx >= g_music_count) return;
     g_music_cur = idx;
-    g_music_dur = music_estimate_duration(g_music_files[idx]);
-    if (g_music_dur <= 0) g_music_dur = 1;
-    g_music_pos = 0;
-    g_music_playing = true;
-    g_music_tick = lv_tick_get();
-    music_update_title();
+    audio_player_play(g_music_files[idx]);
+    /* 此刻播放命令还在队列里，g_audio.hint 可能残留上一首的错误提示，
+     * 所以直接写曲名；若本次打开失败，稍后由 music_timer_cb 刷新成错误提示。 */
+    lv_label_set_text(g_music_title, music_base(g_music_files[g_music_cur]));
     music_update_time();
     lv_slider_set_value(g_music_slider, 0, LV_ANIM_OFF);
     if (g_music_play_lbl) lv_label_set_text(g_music_play_lbl, "暂停");
-    /* TODO: 真正出声 —— 引脚确定后在这里初始化 MP3 解码器，并按真实播放速度
-     *       从文件读取 PCM 经 I2S 输出，再据此推进进度（而非下面的定时器伪推进）。 */
 }
 
 static void music_next(void)
@@ -2048,7 +2007,7 @@ static void music_next(void)
     if (g_music_count == 0) return;
     int n = g_music_cur + 1;
     if (n >= g_music_count) {            /* 到末尾：停 */
-        g_music_playing = false;
+        audio_player_stop();
         if (g_music_play_lbl) lv_label_set_text(g_music_play_lbl, "播放");
         return;
     }
@@ -2058,12 +2017,16 @@ static void music_next(void)
 static void music_slider_cb(lv_event_t *e)
 {
     (void)e;
-    /* 只在用户拖动时 seek（程序更新进度条不触发） */
-    if (lv_obj_has_state(g_music_slider, LV_STATE_PRESSED) && g_music_dur > 0) {
-        int pct = lv_slider_get_value(g_music_slider);   /* 0..1000 */
-        g_music_pos = (int)((long long)g_music_dur * pct);  /* 毫秒 */
-        music_update_time();
+    /* 只在用户拖动时 seek（程序回写进度条时按钮不是 PRESSED 态） */
+    if (lv_obj_has_state(g_music_slider, LV_STATE_PRESSED) && g_audio.dur_ms > 0) {
+        audio_player_seek(lv_slider_get_value(g_music_slider));   /* 0..1000 */
     }
+}
+
+static void music_vol_cb(lv_event_t *e)
+{
+    (void)e;
+    audio_player_set_volume((uint8_t)lv_slider_get_value(g_music_vol_slider));
 }
 
 static void music_prev_cb(lv_event_t *e)
@@ -2088,32 +2051,43 @@ static void music_toggle_cb(lv_event_t *e)
         if (g_music_count > 0) music_play(0);
         return;
     }
-    g_music_playing = !g_music_playing;
-    if (g_music_playing) g_music_tick = lv_tick_get();
+    /* 已播完或未加载时按「播放」应重头播放，否则 resume 会立刻又撞到 EOF */
+    if (!g_audio.loaded || g_audio.pos_ms >= g_audio.dur_ms) {
+        music_play(g_music_cur);
+        return;
+    }
+    bool will_play = !g_audio.playing;
+    if (will_play) audio_player_resume();
+    else           audio_player_pause();
     if (g_music_play_lbl)
-        lv_label_set_text(g_music_play_lbl, g_music_playing ? "暂停" : "播放");
+        lv_label_set_text(g_music_play_lbl, will_play ? "暂停" : "播放");
 }
 
-/* 伪播放推进：按真实时间累加进度（不出声、不解碼） */
+/* 真实播放进度：后台任务写 g_audio 并 version++，这里按 version 变化刷新 UI。
+ * 只在 LVGL 任务里操作控件，不需要 LVGL 锁（与 pc_mon.c 同构）。 */
 static void music_timer_cb(lv_timer_t *t)
 {
     (void)t;
-    if (!g_music_playing || g_music_cur < 0) return;
-    uint32_t now = lv_tick_get();
-    uint32_t dt = now - g_music_tick;
-    g_music_tick = now;
-    g_music_pos += (int)dt;
-    int dur_ms = g_music_dur * 1000;
-    if (g_music_pos >= dur_ms) {
-        g_music_pos = dur_ms;
-        music_update_time();
-        lv_slider_set_value(g_music_slider, 1000, LV_ANIM_OFF);
-        music_next();
-        return;
-    }
+    if (g_audio.version == s_music_shown_ver) return;
+    s_music_shown_ver = g_audio.version;
+
+    music_update_title();
     music_update_time();
-    lv_slider_set_value(g_music_slider,
-                        (int)((long long)g_music_pos * 1000 / dur_ms), LV_ANIM_OFF);
+
+    uint32_t dur = g_audio.dur_ms;
+    int pct = dur ? (int)(((uint64_t)g_audio.pos_ms * 1000) / dur) : 0;
+    if (pct > 1000) pct = 1000;
+    /* 拖动过程中不回写，避免进度条与手指打架 */
+    if (!lv_obj_has_state(g_music_slider, LV_STATE_PRESSED))
+        lv_slider_set_value(g_music_slider, pct, LV_ANIM_OFF);
+
+    if (g_music_play_lbl)
+        lv_label_set_text(g_music_play_lbl, g_audio.playing ? "暂停" : "播放");
+
+    if (g_audio.eof) {
+        audio_player_ack_eof();      /* 先确认，避免重复触发自动下一首 */
+        music_next();
+    }
 }
 
 static lv_obj_t *music_make_btn(lv_obj_t *parent, const char *txt, lv_event_cb_t cb)
@@ -2173,7 +2147,7 @@ static void build_music_screen(lv_obj_t *parent)
 
     /* 曲名 */
     g_music_title = lv_label_create(parent);
-    lv_label_set_text(g_music_title, "未播放");
+    lv_label_set_text(g_music_title, g_music_count > 0 ? "未播放" : "请放入 WAV/MP3");
     lv_obj_set_style_text_font(g_music_title, &lv_font_cn_16, 0);
     lv_obj_set_style_text_color(g_music_title, lv_color_white(), 0);
     lv_obj_align(g_music_title, LV_ALIGN_TOP_MID, 0, 162);
@@ -2206,6 +2180,20 @@ static void build_music_screen(lv_obj_t *parent)
     lv_obj_set_style_text_color(g_music_time_r, lv_color_hex(0xAAAAAA), 0);
     lv_obj_align(g_music_time_r, LV_ALIGN_TOP_RIGHT, -6, 182);
 
+    /* 音量：MAX98357A 没有数字音量寄存器，由 audio_player 在 PCM 上做软件缩放 */
+    g_music_vol_slider = lv_slider_create(parent);
+    lv_obj_set_size(g_music_vol_slider, LCD_W - 120, 8);
+    lv_obj_align(g_music_vol_slider, LV_ALIGN_TOP_MID, 0, 194);
+    lv_slider_set_range(g_music_vol_slider, 0, 100);
+    lv_slider_set_value(g_music_vol_slider, g_audio.volume, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(g_music_vol_slider, lv_color_hex(0x333344), 0);
+    lv_obj_set_style_bg_color(g_music_vol_slider, lv_color_hex(0x1F6FEB), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(g_music_vol_slider, lv_color_white(), LV_PART_KNOB);
+    lv_obj_set_style_radius(g_music_vol_slider, LV_RADIUS_CIRCLE, LV_PART_KNOB);
+    lv_obj_set_style_width(g_music_vol_slider, 10, LV_PART_KNOB);
+    lv_obj_set_style_height(g_music_vol_slider, 10, LV_PART_KNOB);
+    lv_obj_add_event_cb(g_music_vol_slider, music_vol_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
     /* 控制按钮行：上一首 / 播放暂停 / 下一首（无列表，纯播放控制） */
     lv_obj_t *row = lv_obj_create(parent);
     lv_obj_set_size(row, LCD_W, 34);
@@ -2224,7 +2212,7 @@ static void build_music_screen(lv_obj_t *parent)
     g_music_play_lbl = lv_obj_get_child(g_music_play_btn, 0);
     music_make_btn(row, "下一首", music_next_cb);
 
-    /* 伪播放定时器：每 200ms 推进一次进度（不解码、不出声） */
+    /* 状态轮询定时器：每 200ms 检查 g_audio.version，变化才刷新进度/按钮/自动下一首 */
     if (!s_music_timer) s_music_timer = lv_timer_create(music_timer_cb, 200, NULL);
 }
 
@@ -4026,6 +4014,15 @@ static void ui_appmem_poll(void)
 }
 #endif /* UI_MEM_DEBUG */
 
+/* 供文件管理器调用：切到音乐屏并播放指定 WAV（延迟到主循环执行） */
+void ui_open_music_and_play(const char *path)
+{
+    if (!path || !path[0]) return;
+    snprintf(s_music_pending_path, sizeof(s_music_pending_path), "%s", path);
+    s_music_pending = true;
+    g_pending_app = APP_MUSIC;
+}
+
 /* 延迟跳转：点击 App 时只置位 g_pending_app，真正建屏/加载在这里执行，
  * 不在输入事件回调里重入 lv_timer_handler 同步建大量对象（否则卡死看门狗） */
 static void ui_handle_pending_app(void)
@@ -4065,6 +4062,20 @@ static void ui_handle_pending_app(void)
     case APP_MUSIC:
         if (!g_music_screen) { g_music_screen = make_app_screen("音乐"); build_music_screen(g_music_screen); }
         scr = g_music_screen;
+        if (s_music_pending) {
+            s_music_pending = false;
+            music_scan();                       /* 重扫，保证列表包含刚点的文件 */
+            int idx = -1;
+            for (int i = 0; i < g_music_count; i++) {
+                if (strcmp(g_music_files[i], s_music_pending_path) == 0) { idx = i; break; }
+            }
+            if (idx < 0 && g_music_count < MUSIC_MAX_FILES) {
+                snprintf(g_music_files[g_music_count], sizeof(g_music_files[0]),
+                         "%s", s_music_pending_path);
+                idx = g_music_count++;
+            }
+            if (idx >= 0) music_play(idx);
+        }
         break;
     case APP_GAME:
         /* 弹出选择菜单: 2048 / 贪吃蛇 二选一, 不直接切屏 */

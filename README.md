@@ -68,7 +68,7 @@ idf.py flash monitor
 1. 把 microSD 卡格式化为 **FAT32**。
 2. 在根目录直接放文件：
    - 图片：**`.jpg` / `.jpeg` / `.png`**（JPG 用内置 tjpgd 自解码，PNG 走 LVGL）。**不支持 BMP。**
-   - 音乐：任意音频文件（通过文件管理器打开后进入音乐播放器，见第 5 节）。
+   - 音乐：**`.wav`（未压缩 PCM，8/16/24/32 位、单/双声道）** 或 **`.mp3`（MPEG Layer III）**，放在根目录即可（见第 5 节）。FLAC/OGG/AAC 暂不支持，不会出现在播放列表。
 3. 支持**中文文件名**（FATFS 已设为 UTF-8 + CP936）。
 
 ---
@@ -88,10 +88,18 @@ idf.py flash monitor
 - 自动居中显示，超出屏幕部分按比例缩放。
 
 ### 音乐播放器
-界面：黑胶唱片封面 + 曲名 + 进度条（含当前/总时长）+ 三个按钮（上一首 / 播放·暂停 / 下一首）。
-- **上一首 / 下一首**：在 SD 卡音频列表间切换（到末尾停在最后一首）。
-- **播放·暂停**：切换播放状态，文字在「播放 / 暂停」间变化，进度条按固定节奏模拟推进。
-- ⚠️ **当前为演示状态**：进度是模拟推进，**尚未接音频解码与 I2S 出声**（代码中已预留接入点，确定引脚后可接 MP3 解码器+I2S 输出）。
+硬件：ESP32-S3 I2S → **MAX98357AETE+T**（Class D 功放，3 线 BCLK/LRCK/DIN，无需 MCLK、无需 I2C 配置）。
+引脚在 `main/board.h` 的 `AUDIO_I2S_*` 宏集中定义（默认 BCLK=9 / LRCK=10 / DOUT=11 / SD_MODE=12，请按实际接线核对）。
+
+界面：黑胶唱片封面 + 曲名 + 进度条（含当前/总时长）+ 音量条 + 三个按钮（上一首 / 播放·暂停 / 下一首）。
+- 播放链路：开机 `audio_player_init()` 建 I2S 通道与后台任务（栈/缓冲放 PSRAM）→ WAV 直接取 PCM / MP3 经 **minimp3** 解码 → 统一转成 16bit 双声道 → `i2s_channel_write` 真实输出，**进度由实际送出的字节/采样数推进**，到尾自动下一首。
+- **WAV**：未压缩 PCM，8/16/24/32 位、单/双声道；时长由头精确计算，seek 精确。
+- **MP3**：MPEG Layer III（`main/minimp3.h` 单文件解码器，CC0 公共领域，零外部依赖、约 30KB Flash / 20KB PSRAM）。支持 ID3v2 标签、CBR 与 VBR（Xing/Info/VBRI 帧数）；不支持 Layer I/II、FLAC/OGG/AAC。
+  - 时长：有 Xing/VBRI 帧数时精确，纯 CBR 文件按首帧码率估算（可能偏差几秒）。
+  - **seek 是近似的**：MP3 没有帧索引，按字节比例定位后重新找帧同步，VBR 文件偏差更明显。
+- **上一首 / 下一首**：在 SD 卡音频列表（WAV + MP3）间切换（到末尾停止）。文件管理器里点音频文件也能直接跳转播放。
+- **播放·暂停**：真正暂停/恢复 I2S 输出，并关断/开启功放 SD_MODE（暂停无底噪）。
+- **拖动进度条**：seek；**音量条**：PCM 软件缩放 0~100%。
 
 ### 天气 / 时钟 / 闹钟
 - 需要 **WiFi 联网**：时钟通过 NTP 同步时间，天气通过在线接口获取。
@@ -124,9 +132,12 @@ idf.py flash monitor
 .
 ├── main/                 # 应用代码
 │   ├── ui.c              # 主界面与各应用 UI（图片/音乐/天气/游戏/...）
+│   ├── audio_player.c    # 播放引擎：WAV/MP3 解码 → I2S → MAX98357A
+│   ├── minimp3.h         # MP3 解码器（单头文件，CC0 公共领域，无外部依赖）
+│   ├── minimp3_impl.c    # minimp3 实现编译单元（只在此展开一次）
 │   ├── media.c           # 图片解码（JPG 自解码 + PNG）
 │   ├── file_mgr.c        # 文件管理器
-│   ├── sd_card.c         # SD 卡挂载（SDMMC，4线→1线回退）
+│   ├── sd_card.c         # SD 卡挂载（1线40MHz 优先，失败回退低速/4线）
 │   ├── weather.c / time_sync.c / alarm.c / ble_scan.c / wifi_scan.c / pc_mon.c ...
 │   ├── lv_font_cn_16.c   # 中文字库（16px）
 │   └── ...
@@ -143,7 +154,7 @@ idf.py flash monitor
 
 ## 7. 已知限制与注意事项
 
-- **音乐不出声**：当前为演示版，进度为模拟推进，未接音频硬件。
+- **音乐格式**：仅 WAV(PCM) 与 MP3(Layer III)；FLAC/OGG/AAC 需额外解码器。I2S 引脚见 `main/board.h`，接线不对会完全无声（先确认 SD_MODE 是否被拉低关断）。
 - **图片仅 JPG/PNG**：BMP 不支持（屏幕小、解码器误读头易出问题，已主动放弃）。
 - **屏幕 320×240**：大图会自动缩放；PNG 整帧解码较占内存，已通过 `sdkconfig.defaults` 调大 LVGL 缓存。
 - **内部 DRAM 紧张**：LVGL 内存池、图片缓存、PSRAM 预留等已在 `sdkconfig.defaults` 优化，改动需谨慎。

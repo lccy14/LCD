@@ -8,8 +8,9 @@
  *  驱动 / 服务 / 界面一律引用这里的宏，不得出现任何裸 GPIO 号，
  *  这样硬件接线变了只动这一层，上层一行不用改。
  *
- *  当前板：ST7789 1.14" 并口 8bit + FT6336 触摸(I2C) + SD(SDMMC 4线)。
- *  音频 / LED 暂未焊接，仅在底部留位置占位。
+ *  当前板：ST7789 1.14" 并口 8bit + FT6336 触摸(I2C) + SD(SDMMC 4线)
+ *           + MAX98357AETE+T 功放(I2S，BCLK/LRCK/DIN/SD_MODE)。
+ *  RGB LED 暂未焊接，仅在底部留位置占位。
  * ============================================================ */
 
 #include <stdint.h>
@@ -45,10 +46,24 @@
 #define SDMMC_PIN_D2    1
 #define SDMMC_PIN_D3    2
 
+/* ---------- 音频：MAX98357AETE+T（I2S 输入、Class D 功放） ----------
+ * 只需 3 根信号线：BCLK / LRCK(WS) / DIN(接主控 DOUT)。
+ * MAX98357A 内部从 BCLK 恢复时钟，不需要 MCLK；无需 I2C 配置寄存器。
+ * SD_MODE 用于关断控制：低=shutdown(静音省电)，高=正常工作。
+ *   若硬件把 SD_MODE 直接上拉到 VDD，把下面宏改成 GPIO_NUM_NC 即跳过控制。
+ *
+ * 选 GPIO9~12 的原因：这几个脚当前空闲，且不在 Octal PSRAM 占用的
+ * GPIO33~37 范围内 —— 后期换 N16R8 时音频接线无需改动。
+ * ⚠️ 请按实际飞线核对，改这里即可，驱动层不出现裸 GPIO 号。
+ */
+#define AUDIO_I2S_BCLK_GPIO    GPIO_NUM_9
+#define AUDIO_I2S_LRCK_GPIO    GPIO_NUM_10
+#define AUDIO_I2S_DOUT_GPIO    GPIO_NUM_11
+#define AUDIO_I2S_SD_MODE_GPIO GPIO_NUM_12
+
 /* ---------- 预留（暂未焊接，加功能/换板时在此登记） ----------
- * 音频 NS4160 (PWM/Sigma-Delta 方案): #define BOARD_AUDIO_PIN  GPIO_NUM_x
- * RGB LED WS2812 (RMT 方案)         : #define BOARD_LED_PIN    GPIO_NUM_x
- * 触摸备选 IQS333 (I2C)             : 复用 FT6336 的 SDA/SCL，改地址即可
+ * RGB LED WS2812 (RMT 方案) : #define BOARD_LED_PIN    GPIO_NUM_x
+ * 触摸备选 IQS333 (I2C)     : 复用 FT6336 的 SDA/SCL，改地址即可
  */
 
 #endif /* __BOARD_H */

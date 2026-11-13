@@ -13,6 +13,8 @@
 #include "esp_attr.h"     /* EXT_RAM_BSS_ATTR：把大数组放到 PSRAM，省内部 DRAM */
 #include "esp_log.h"
 #include "media.h"        /* 图片/视频：判断扩展名，决定「打开」按钮干什么 */
+#include "audio_player.h" /* WAV：判断能否播放 */
+#include "ui.h"           /* 点 WAV 时切到音乐屏播放 */
 
 /* 界面字体：LVGL 内置 montserrat 不含汉字，中文一律用 lv_font_cn_16 */
 LV_FONT_DECLARE(lv_font_cn_16);
@@ -47,6 +49,7 @@ typedef enum {
     FM_CMD_LIST,      /* 列出 s_cmd_path 目录 */
     FM_CMD_VIEW,      /* 预览 s_cmd_path 文本文件 */
     FM_CMD_IMAGE,     /* 用图片查看器打开 s_cmd_path */
+    FM_CMD_AUDIO,     /* 切到音乐屏播放 s_cmd_path 的 WAV */
     FM_CMD_DELETE     /* 删除 s_cmd_path */
 } fm_cmd_t;
 
@@ -476,14 +479,14 @@ static void row_click_cb(lv_event_t *e)
     elide_name(nm, disp, sizeof(disp), lv_obj_get_width(s_d_name) * 2);
     lv_label_set_text(s_d_name, disp);
 
-    /* 「打开」按钮：文本=预览，图片=看图，其它类型不支持 */
+    /* 「打开」按钮：文本=预览，图片=看图，WAV=播放，其它类型不支持 */
     const char *open_txt = NULL;
-    if (media_is_image(nm))      open_txt = "看图";
-    else if (is_text_file(nm))   open_txt = "打开";
+    const char *info_txt = "暂不支持预览";
+    if (media_is_image(nm))            { open_txt = "看图"; info_txt = "图片，可查看"; }
+    else if (is_text_file(nm))         { open_txt = "打开"; info_txt = "文本，可预览"; }
+    else if (audio_player_supported(nm)) { open_txt = "播放"; info_txt = "音频，可播放"; }
 
-    lv_label_set_text_fmt(s_d_info, "大小 %s\n%s", sz,
-                          open_txt ? (media_is_image(nm) ? "图片，可查看" : "文本，可预览")
-                                   : "暂不支持预览");
+    lv_label_set_text_fmt(s_d_info, "大小 %s\n%s", sz, info_txt);
     if (open_txt) {
         lv_label_set_text(s_d_open_lbl, open_txt);
         lv_obj_clear_flag(s_d_open, LV_OBJ_FLAG_HIDDEN);
@@ -509,10 +512,11 @@ static void detail_open_cb(lv_event_t *e)
     char full[FM_PATH_LEN];
     path_join(full, sizeof(full), s_cwd, s_entries[s_sel].name);
     snprintf(s_cmd_path, sizeof(s_cmd_path), "%s", full);
-    /* 按类型分发：文本→预览，图片→看图 */
-    if (media_is_image(s_entries[s_sel].name))      s_cmd = FM_CMD_IMAGE;
-    else                                            s_cmd = FM_CMD_VIEW;
-    }
+    /* 按类型分发：文本→预览，图片→看图，WAV→切到音乐屏播放 */
+    if (media_is_image(s_entries[s_sel].name))        s_cmd = FM_CMD_IMAGE;
+    else if (audio_player_supported(s_entries[s_sel].name)) s_cmd = FM_CMD_AUDIO;
+    else                                              s_cmd = FM_CMD_VIEW;
+}
 
 static void detail_del_cb(lv_event_t *e)
 {
@@ -817,6 +821,10 @@ void file_mgr_periodic(void)
     case FM_CMD_IMAGE:
         lv_obj_add_flag(s_detail, LV_OBJ_FLAG_HIDDEN);   /* 进看图，详情页收起来 */
         media_image_open(s_cmd_path);
+        break;
+    case FM_CMD_AUDIO:
+        lv_obj_add_flag(s_detail, LV_OBJ_FLAG_HIDDEN);   /* 进音乐，详情页收起来 */
+        ui_open_music_and_play(s_cmd_path);
         break;
     case FM_CMD_DELETE:
         fm_delete(s_cmd_path);
