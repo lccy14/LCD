@@ -3,6 +3,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include <stdio.h>
 
 static const char *TAG = "FT6336";
 
@@ -27,9 +28,30 @@ static esp_err_t ft6336_read_reg(uint8_t reg, uint8_t *buf, size_t len)
     return i2c_master_transmit_receive(s_dev, &reg, 1, buf, len, FT6336_I2C_TIMEOUT);
 }
 
+/* 初始化失败时扫一遍 I2C 总线，把有 ACK 的地址都打出来。
+ * 用来区分三类问题：一个设备都没有(供电/接线/上拉)、地址不同(换了触摸 IC)、
+ * 地址对但时序不对。只在失败路径执行一次，不影响正常运行。 */
+static void ft6336_scan_bus(void)
+{
+    char list[160] = {0};
+    size_t used = 0;
+    for (uint8_t a = 0x08; a <= 0x77; a++) {
+        if (i2c_master_probe(s_bus, a, 5) == ESP_OK) {
+            int n = snprintf(list + used, sizeof(list) - used, " 0x%02X", a);
+            if (n < 0 || (size_t)n >= sizeof(list) - used) break;
+            used += (size_t)n;
+        }
+    }
+    ESP_LOGE(TAG, "I2C 扫描 SCL=GPIO%d SDA=GPIO%d 命中:%s",
+             (int)FT6336_SCL_GPIO, (int)FT6336_SDA_GPIO,
+             used ? list : " (无设备 —— 检查供电/接线/上拉)");
+}
+
 esp_err_t ft6336_init(void)
 {
-    /* 1. 配置 INT 引脚为输入（FT6336 触摸时拉低；此处轮询，仅配置不接中断） */
+    /* 1. INT 必须先配置好，再释放复位。
+     *    部分 FT6x36 在 RST 上升沿采样 INT 电平来选择 I2C 地址(0x38/0x39)，
+     *    若先复位再配 INT，地址可能落到备选值上。 */
     gpio_config_t io_conf = {
         .pin_bit_mask = (1ULL << FT6336_INT_GPIO),
         .mode         = GPIO_MODE_INPUT,
@@ -38,7 +60,26 @@ esp_err_t ft6336_init(void)
     };
     gpio_config(&io_conf);
 
-    /* 2. 创建 I2C 主机（ESP-IDF v6 新 API） */
+#ifdef FT6336_RST_GPIO
+    /* 2. 第二版 PCB 把复位脚接到了 MCU（TP_RES）。FT6336 低电平复位，
+     *    拉低 10ms 再拉高释放。第一版 RST 直连 3V3，无此宏则跳过。
+     *    ⚠️ 拉高后芯片要跑内部固件，通常 100~300ms 才回 I2C ACK；
+     *       绝不能只等 20ms 就读 chip_id（之前识别不到就是这个原因）。
+     *       下面用 probe 轮询等就绪，芯片一 ACK 就继续，不空等固定时长。 */
+    gpio_config_t rst_conf = {
+        .pin_bit_mask = (1ULL << FT6336_RST_GPIO),
+        .mode         = GPIO_MODE_OUTPUT,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&rst_conf);
+    gpio_set_level(FT6336_RST_GPIO, 0);
+    vTaskDelay(pdMS_TO_TICKS(10));
+    gpio_set_level(FT6336_RST_GPIO, 1);
+#endif
+
+    /* 3. 创建 I2C 主机（ESP-IDF v6 新 API） */
     i2c_master_bus_config_t bus_cfg = {
         .i2c_port       = FT6336_I2C_PORT,
         .sda_io_num     = FT6336_SDA_GPIO,
@@ -53,29 +94,57 @@ esp_err_t ft6336_init(void)
         return ret;
     }
 
-    /* 3. 固定地址 0x38 注册设备 */
+    /* 4. 轮询等待就绪，并自动识别 0x38 / 0x39。
+     *    probe 只发地址不读寄存器，最适合判断"芯片活没活"。
+     *    15 次 × 30ms ≈ 450ms 窗口，覆盖复位后的启动时间。 */
+    const uint16_t cand[] = { FT6336_I2C_ADDR, FT6336_I2C_ADDR_ALT };
+    uint16_t addr = 0;
+    for (int i = 0; i < 15 && !addr; i++) {
+        for (size_t k = 0; k < sizeof(cand) / sizeof(cand[0]); k++) {
+            if (i2c_master_probe(s_bus, cand[k], 20) == ESP_OK) {
+                addr = cand[k];
+                break;
+            }
+        }
+        if (!addr) vTaskDelay(pdMS_TO_TICKS(30));
+    }
+    if (!addr) {
+        ESP_LOGE(TAG, "复位后 450ms 内 I2C 无应答 (RST/供电/接线?)");
+        ft6336_scan_bus();
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    /* 5. 用实际探测到的地址注册设备 */
     i2c_device_config_t dev_cfg = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address  = FT6336_I2C_ADDR,
+        .device_address  = addr,
         /* FT6336 支持 400kHz 快速模式；100kHz 时单次读 5 字节约 0.9ms，
          * 提到 400kHz 后约 0.25ms，直接省掉每帧 0.65ms 的 I2C 时间。 */
         .scl_speed_hz    = 400000,
     };
-    if (i2c_master_bus_add_device(s_bus, &dev_cfg, &s_dev) != ESP_OK) {
-        ESP_LOGE(TAG, "add device 0x%02X failed", FT6336_I2C_ADDR);
-        return ESP_ERR_NOT_FOUND;
-    }
-    uint8_t id[2] = {0};
-    if (i2c_master_transmit_receive(s_dev, (uint8_t[]){0xA8}, 1, id, 2,
-                                    FT6336_I2C_TIMEOUT) == ESP_OK) {
-        ESP_LOGI(TAG, "FT6336 found at addr 0x%02X, chip_id=%02X%02X",
-                 FT6336_I2C_ADDR, id[0], id[1]);
-    } else {
-        ESP_LOGE(TAG, "FT6336 read chip_id failed (check wiring/RST/power)");
+    ret = i2c_master_bus_add_device(s_bus, &dev_cfg, &s_dev);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "add device 0x%02X failed: %d", addr, ret);
         return ESP_ERR_NOT_FOUND;
     }
 
-    /* 4. 软复位（进入正常模式） */
+    /* 6. 读 chip_id 也留 3 次重试，兼容固件刚起来时偶发 NACK */
+    uint8_t id[2] = {0};
+    bool id_ok = false;
+    for (int i = 0; i < 3 && !id_ok; i++) {
+        id_ok = (i2c_master_transmit_receive(s_dev, (uint8_t[]){0xA8}, 1, id, 2,
+                                             FT6336_I2C_TIMEOUT) == ESP_OK);
+        if (!id_ok) vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    if (!id_ok) {
+        ESP_LOGE(TAG, "FT6336 read chip_id failed at 0x%02X", addr);
+        ft6336_scan_bus();
+        return ESP_ERR_NOT_FOUND;
+    }
+    ESP_LOGI(TAG, "FT6336 found at addr 0x%02X, chip_id=%02X%02X",
+             addr, id[0], id[1]);
+
+    /* 7. 软复位（进入正常模式） */
     ft6336_write_reg(0xAE, 0x00);
     vTaskDelay(pdMS_TO_TICKS(10));
 

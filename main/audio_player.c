@@ -14,6 +14,7 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "minimp3.h"          /* 公共领域单头文件 MP3 解码器 */
+#include "mic_rec.h"          /* 录音中拒绝播放（互斥），避免回授与 SD/CPU 争抢 */
 
 static const char *TAG = "AUDIO";
 
@@ -418,6 +419,11 @@ static void handle_cmd(const audio_cmd_t *c)
 {
     switch (c->id) {
     case CMD_PLAY: {
+        if (mic_rec_is_recording()) {
+            set_hint("录音中，请先停止录音");
+            publish();
+            break;
+        }
         track_reset();
         size_t len = strlen(c->path);
         bool is_mp3 = len >= 4 && strcasecmp(c->path + len - 4, ".mp3") == 0;

@@ -51,10 +51,11 @@ static const size_t k_pool_chunks[] = {
     64 * 1024,
 };
 
-/* PARTIAL 渲染模式: 两个内部 RAM draw buf, 每个 320×40×2=25KB。
- * 内部 SRAM 访问速度比 PSRAM 快 5-10 倍, LVGL 渲染加速;
- * 两个 buf 让 LVGL 渲染下一块时上一块同时 DMA 发送, 双缓冲流水线。
- * 内部 RAM 空闲 240KB, 50KB 占用绰绰有余。 */
+/* PARTIAL 渲染模式: 两个内部 RAM draw buf (GDMA 要求内部 RAM)。
+ * 曾因 HTTPS 握手期内部 RAM 耗尽 (x509 验证时 xQueueCreateMutex 失败 abort)
+ * 临时降到 20 止血。现已把音乐路径表(24KB)+书单(14KB)挪到 PSRAM,
+ * 内部 RAM 富余 ~100KB, 故恢复 40: 每帧刷一次即可, 渲染/触摸更跟手。
+ * 若日后又加吃内部 RAM 的功能再考虑降回。 */
 #define DISP_BUF_H    40
 #define DISP_BUF_SIZE (LCD_W * DISP_BUF_H * sizeof(lv_color_t))
 

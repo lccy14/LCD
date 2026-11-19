@@ -1,6 +1,9 @@
 #include "ui.h"
 #include "sd_card.h"
 #include "audio_player.h"
+#include "mic_rec.h"
+#include "ai_chat.h"
+#include "voice_asr.h"
 #include "wifi_scan.h"   /* WiFi 初始化提前到 UI 之前：RAM 最空时连，避开进书把 DMA 吃光导致重试失败 */
 #include "esp_log.h"     /* ESP_LOGE */
 
@@ -22,6 +25,17 @@ void app_main(void)
     /* 音频播放引擎：此时 LVGL / 小说等还没占用内存，先申请 PSRAM 缓冲与后台任务栈。
      * 只建通道与任务，不播放；SD_MODE 保持关断，开机不会有噗声。 */
     audio_player_init();
+
+    /* 录音引擎：只分配 PSRAM 缓冲与建后台任务，I2S1 RX 通道要等首次录音
+     * 才申请（内部 DMA 内存紧张，平时不占）。同样排在 LVGL 之前。 */
+    mic_rec_init();
+
+    /* AI 聊天后台任务（栈/缓冲在 PSRAM），排在 LVGL 之前；
+     * 未配置 Key 时不发请求，只占任务栈。 */
+    ai_chat_init();
+
+    /* 语音识别后台任务（栈/缓冲在 PSRAM），复用 AI 模块的智谱 Key */
+    voice_asr_init();
 
     ui_app_start();
 }

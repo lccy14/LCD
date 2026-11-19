@@ -1,0 +1,98 @@
+﻿[1/10] Building C object esp-idf/main/CMakeFiles/__idf_main.dir/main.c.obj
+[2/10] Building C object esp-idf/main/CMakeFiles/__idf_main.dir/voice_asr.c.obj
+[3/10] Linking C static library esp-idf\main\libmain.a
+[4/10] Performing build step for 'bootloader'
+[0/1] Re-running CMake...
+-- Component directory C:/.espressif/v6.0.1/esp-idf/components/mqtt does not contain a CMakeLists.txt file. No component will be added
+-- Minimal build - OFF
+-- Building ESP-IDF components for target esp32s3
+-- ESP-TEE is currently supported only on the esp32c6;esp32h2;esp32c5;esp32c61 SoCs
+-- KCONFIG_REPORT_VERBOSITY not set, using default
+-- Project sdkconfig file C:/esp32/LCD/sdkconfig
+info: Default value for FREERTOS_HZ in sdkconfig is 1000 but it is 100 according to Kconfig.
+Using default value from sdkconfig (1000).
+Configuration Report                                                           
++-----------------------------------------------------------------------------+
+|  Parser Version: 1                                                          |
+|  Verbosity: default                                                         |
+|  Defaults policy: sdkconfig                                                 |
+|  Status: Finished with notifications                                        |
+|                                                                             |
+| Default Value Mismatch                                                      |
+| +-------------------------------------------------------------------------+ |
+| | Using sdkconfig default values                                       |  | |
+| | Config symbols with different default value between sdkconfig and    |  | |
+| | Kconfig                                                              |  | |
+| | FREERTOS_HZ: Kconfig default value: 100, sdkconfig default value:    |  | |
+| | 1000                                                                 |  | |
+| +-------------------------------------------------------------------------+ |
++-----------------------------------------------------------------------------+
+-- Compiler supported targets: xtensa-esp-elf
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Adding linker script C:/.espressif/v6.0.1/esp-idf/components/soc/esp32s3/ld/esp32s3.peripherals.ld
+-- Bootloader project name: "bootloader" version: 1
+-- Adding linker script C:/.espressif/v6.0.1/esp-idf/components/esp_hal_wdt/esp32s3/rom.wdt.ld
+-- Adding linker script C:/.espressif/v6.0.1/esp-idf/components/esp_rom/esp32s3/ld/esp32s3.rom.ld
+-- Adding linker script C:/.espressif/v6.0.1/esp-idf/components/esp_rom/esp32s3/ld/esp32s3.rom.api.ld
+-- Adding linker script C:/.espressif/v6.0.1/esp-idf/components/esp_rom/esp32s3/ld/esp32s3.rom.bt_funcs.ld
+-- Adding linker script C:/.espressif/v6.0.1/esp-idf/components/esp_rom/esp32s3/ld/esp32s3.rom.libgcc.ld
+-- Adding linker script C:/.espressif/v6.0.1/esp-idf/components/esp_rom/esp32s3/ld/esp32s3.rom.version.ld
+-- Adding linker script C:/.espressif/v6.0.1/esp-idf/components/esp_rom/esp32s3/ld/esp32s3.rom.libc.ld
+-- Components: bootloader bootloader_support efuse esp_app_format esp_blockdev esp_bootloader_format esp_common esp_hal_ana_conv esp_hal_clock esp_hal_dma esp_hal_gpio esp_hal_gpspi esp_hal_mspi esp_hal_pmu esp_hal_rtc_timer esp_hal_security esp_hal_timg esp_hal_uart esp_hal_usb esp_hal_wdt esp_hw_support esp_libc esp_rom esp_security esp_stdio esp_system esptool_py freertos hal log main micro-ecc partition_table soc spi_flash xtensa
+-- Component paths: C:/.espressif/v6.0.1/esp-idf/components/bootloader C:/.espressif/v6.0.1/esp-idf/components/bootloader_support C:/.espressif/v6.0.1/esp-idf/components/efuse C:/.espressif/v6.0.1/esp-idf/components/esp_app_format C:/.espressif/v6.0.1/esp-idf/components/esp_blockdev C:/.espressif/v6.0.1/esp-idf/components/esp_bootloader_format C:/.espressif/v6.0.1/esp-idf/components/esp_common C:/.espressif/v6.0.1/esp-idf/components/esp_hal_ana_conv C:/.espressif/v6.0.1/esp-idf/components/esp_hal_clock C:/.espressif/v6.0.1/esp-idf/components/esp_hal_dma C:/.espressif/v6.0.1/esp-idf/components/esp_hal_gpio C:/.espressif/v6.0.1/esp-idf/components/esp_hal_gpspi C:/.espressif/v6.0.1/esp-idf/components/esp_hal_mspi C:/.espressif/v6.0.1/esp-idf/components/esp_hal_pmu C:/.espressif/v6.0.1/esp-idf/components/esp_hal_rtc_timer C:/.espressif/v6.0.1/esp-idf/components/esp_hal_security C:/.espressif/v6.0.1/esp-idf/components/esp_hal_timg C:/.espressif/v6.0.1/esp-idf/components/esp_hal_uart C:/.espressif/v6.0.1/esp-idf/components/esp_hal_usb C:/.espressif/v6.0.1/esp-idf/components/esp_hal_wdt C:/.espressif/v6.0.1/esp-idf/components/esp_hw_support C:/.espressif/v6.0.1/esp-idf/components/esp_libc C:/.espressif/v6.0.1/esp-idf/components/esp_rom C:/.espressif/v6.0.1/esp-idf/components/esp_security C:/.espressif/v6.0.1/esp-idf/components/esp_stdio C:/.espressif/v6.0.1/esp-idf/components/esp_system C:/.espressif/v6.0.1/esp-idf/components/esptool_py C:/.espressif/v6.0.1/esp-idf/components/freertos C:/.espressif/v6.0.1/esp-idf/components/hal C:/.espressif/v6.0.1/esp-idf/components/log C:/.espressif/v6.0.1/esp-idf/components/bootloader/subproject/main C:/.espressif/v6.0.1/esp-idf/components/bootloader/subproject/components/micro-ecc C:/.espressif/v6.0.1/esp-idf/components/partition_table C:/.espressif/v6.0.1/esp-idf/components/soc C:/.espressif/v6.0.1/esp-idf/components/spi_flash C:/.espressif/v6.0.1/esp-idf/components/xtensa
+-- Adding linker script C:/.espressif/v6.0.1/esp-idf/components/bootloader/subproject/main/ld/esp32s3/bootloader.ld.in
+--   -> Preprocessing .in script: C:/.espressif/v6.0.1/esp-idf/components/bootloader/subproject/main/ld/esp32s3/bootloader.ld.in
+-- Configuring done (15.6s)
+-- Generating done (0.4s)
+-- Build files have been written to: C:/esp32/LCD/build/bootloader
+[1/2] C:\WINDOWS\system32\cmd.exe /C "cd /D C:\esp32\LCD\build\bootloader && C:\Espressif\tools\python\v6.0.1\venv\Scripts\python.exe C:/.espressif/v6.0.1/esp-idf/components/partition_table/check_sizes.py --offset 0x8000 bootloader 0x0 C:/esp32/LCD/build/bootloader/bootloader.bin"
+Bootloader binary size 0x57e0 bytes. 0x2820 bytes (31%) free.
+
+
+[5/10] No install step for 'bootloader'
+[6/10] Completed 'bootloader'
+[7/10] Generating esp-idf/esp_system/ld/sections.ld
+info: Default value for HTTPD_WS_SUPPORT in sdkconfig is y but it is n according to Kconfig.
+Using default value from sdkconfig (y).
+info: Default value for SPIRAM in sdkconfig is y but it is n according to Kconfig.
+Using default value from sdkconfig (y).
+info: Default value for FREERTOS_HZ in sdkconfig is 1000 but it is 100 according to Kconfig.
+Using default value from sdkconfig (1000).
+info: Default value for LWIP_SNTP_MAX_SERVERS in sdkconfig is 3 but it is 1 according to Kconfig.
+Using default value from sdkconfig (3).
+info: Default value for MBEDTLS_SSL_VARIABLE_BUFFER_LENGTH in sdkconfig is y but it is n according to Kconfig.
+Using default value from sdkconfig (y).
+info: Default value for LV_DEF_REFR_PERIOD in sdkconfig is 20 but it is 33 according to Kconfig.
+Using default value from sdkconfig (20).
+info: Default value for LV_DRAW_SW_SUPPORT_RGB565_SWAPPED in sdkconfig is n but it is y according to Kconfig.
+Using default value from sdkconfig (n).
+info: Default value for LV_FONT_MONTSERRAT_16 in sdkconfig is y but it is n according to Kconfig.
+Using default value from sdkconfig (y).
+info: Default value for LV_FONT_MONTSERRAT_20 in sdkconfig is y but it is n according to Kconfig.
+Using default value from sdkconfig (y).
+info: Default value for LV_FONT_MONTSERRAT_24 in sdkconfig is y but it is n according to Kconfig.
+Using default value from sdkconfig (y).
+info: Default value for LV_FONT_FMT_TXT_LARGE in sdkconfig is y but it is n according to Kconfig.
+Using default value from sdkconfig (y).
+
+[8/10] Linking CXX executable LCD.elf
+[9/10] Generating binary image from built executable
+esptool v5.3.0
+
+Creating ESP32-S3 image...
+
+Merged 3 ELF sections.
+
+Successfully created ESP32-S3 image.
+
+Generated C:/esp32/LCD/build/LCD.bin
+[10/10] C:\WINDOWS\system32\cmd.exe /C "cd /D C:\esp32\LCD\build && C:\Espressif\tools\python\v6.0.1\venv\Scripts\python.exe C:/.espressif/v6.0.1/esp-idf/components/partition_table/check_sizes.py --offset 0x8000 partition --type app C:/esp32/LCD/build/partition_table/partition-table.bin C:/esp32/LCD/build/LCD.bin"
+LCD.bin binary size 0x4ee2c0 bytes. Smallest app partition is 0x600000 bytes. 0x111d40 bytes (18%) free.
+

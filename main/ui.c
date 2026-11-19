@@ -27,6 +27,11 @@
 #include "sd_card.h"          /* SD_MOUNT_POINT / sd_card_mount / sd_card_is_mounted，小说扫 SD 卡电子书 */
 #include "media.h"            /* 图片查看（JPG/PNG/BMP） */
 #include "audio_player.h"     /* I2S → MAX98357A 真实播放 */
+#include "mic_rec.h"          /* I2S1 RX 麦克风录音 → WAV */
+#include "ai_chat.h"          /* AI 聊天：国内 HTTPS API（可切平台）→ 回复 */
+#include "voice_asr.h"        /* 语音输入：录音 WAV → 智谱 ASR → 文字 */
+#include "src/widgets/ime/lv_ime_pinyin.h"  /* 拼音输入法：键盘打中文 */
+#include "lv_pinyin_dict_cn.h" /* 简体拼音字典（2 万字，覆盖内置字典缺的字） */
 #include <dirent.h>           /* 音乐：扫描 SD 卡音频文件（opendir/readdir） */
 #include <strings.h>          /* strcasecmp，音乐扩展名判断 */
 #include <sys/stat.h>         /* stat，估算音频时长 */
@@ -179,6 +184,7 @@ static lv_obj_t *g_pwd_panel = NULL;
 static lv_obj_t *g_pwd_ta    = NULL;
 static lv_obj_t *g_pwd_kb    = NULL;
 static lv_obj_t *g_pwd_ssid  = NULL;
+static lv_obj_t *g_pwd_ime   = NULL;   /* 拼音输入法，绑定 g_pwd_kb */
 static bool      g_pending_pwd = false;
 static char      g_pending_ssid[33];
 
@@ -231,9 +237,28 @@ static lv_obj_t *g_alarm_popup_box = NULL;
 static lv_obj_t *g_alarm_popup_msg = NULL;
 static lv_obj_t *g_wx_city    = NULL;
 static lv_obj_t *g_wx_temp    = NULL;
-static lv_obj_t *g_wx_desc    = NULL;
 static lv_obj_t *g_wx_extra   = NULL;
+static lv_obj_t *g_wx_air     = NULL;   /* 湿度 + 空气质量 */
 static lv_obj_t *g_wx_updated = NULL;
+
+/* AI 聊天屏：消息列表 + 输入框 + 拼音键盘 + Key 设置框 */
+static lv_obj_t *g_ai_screen = NULL;
+static lv_obj_t *g_ai_chat_box = NULL;    /* 消息列表（可滚动） */
+static lv_obj_t *g_ai_bar = NULL;         /* 顶部 Key/清空按钮行，输入时隐藏 */
+static lv_obj_t *g_ai_ta = NULL;          /* 提问输入框 */
+static lv_obj_t *g_ai_kb = NULL;          /* 拼音键盘 */
+static lv_obj_t *g_ai_kb_cancel = NULL;   /* 输入态的「收起键盘」按钮 */
+static lv_obj_t *g_ai_ime = NULL;
+static lv_obj_t *g_ai_key_panel = NULL;   /* API Key 设置浮层 */
+static lv_obj_t *g_ai_key_ta = NULL;
+static lv_obj_t *g_ai_key_title = NULL;   /* 标题（显示当前平台名） */
+static lv_obj_t *g_ai_key_switch = NULL;  /* 切换平台按钮 */
+static lv_obj_t *g_ai_key_kb = NULL;      /* Key 浮层专用键盘（可收起） */
+static lv_obj_t *g_ai_thinking_bubble = NULL;  /* 「思考中」气泡，回复到了直接改文字 */
+static lv_obj_t *g_ai_voice_btn = NULL;   /* 语音输入按钮（点开始/停止录音） */
+static lv_obj_t *g_ai_voice_lbl = NULL;   /* 语音按钮文字（录音/识别状态） */
+static uint32_t  s_ai_shown_ver = 0;
+static uint32_t  s_asr_shown_ver = 0;
 
 /* 电脑监控屏：传感器行标签池（最多 PC_MON_MAX_SENSORS 行，懒加载创建一次） */
 static lv_obj_t *g_pcmon_screen = NULL;
@@ -521,6 +546,9 @@ static void add_placeholder(lv_obj_t *scr, const char *msg);
 static void build_pcmon_screen(lv_obj_t *scr);
 static void build_alarm_screen(lv_obj_t *scr);
 static void build_ble_screen(lv_obj_t *scr);
+/* AI Key 浮层：创建在顶层 layer，设置屏和聊天屏都能打开 */
+static void ai_key_open_cb(lv_event_t *e);
+static void build_ai_key_panel(void);
 
 /* 返回主界面 */
 static void go_home_cb(lv_event_t *e)
@@ -625,6 +653,19 @@ static void ui_switch_mask(lv_obj_t *scr)
 }
 #endif
 
+/* OVER 位移动画在 PARTIAL 模式下会留残影：动画期间透明容器（g_ai_bar / pcmon
+ * cont 等）覆盖的区域不产生绘制，动画结束后 LCD GRAM 里仍是旧屏像素。
+ * 动画完成后延迟一帧强制整屏 invalidate，让新屏背景(COVER)重刷一遍清掉残影。 */
+static lv_obj_t *s_switch_redraw_scr = NULL;
+
+static void switch_redraw_cb(lv_timer_t *t)
+{
+    (void)t;
+    if (s_switch_redraw_scr && lv_obj_is_valid(s_switch_redraw_scr))
+        lv_obj_invalidate(s_switch_redraw_scr);   /* 整屏标脏，下一帧重绘 */
+    s_switch_redraw_scr = NULL;
+}
+
 static void ui_switch(lv_obj_t *scr, bool back)
 {
 #if UI_ANIM_USE_MASK_FADE
@@ -633,6 +674,11 @@ static void ui_switch(lv_obj_t *scr, bool back)
     lv_screen_load_anim(scr,
                         back ? LV_SCREEN_LOAD_ANIM_OVER_RIGHT : LV_SCREEN_LOAD_ANIM_OVER_LEFT,
                         APP_ANIM_MS, 0, false);
+    /* 动画结束 + 一点余量后整屏重绘一次，消除透明容器区域的旧屏残影 */
+    lv_timer_t *t = lv_timer_create(switch_redraw_cb, APP_ANIM_MS + 40, NULL);
+    lv_timer_set_repeat_count(t, 1);      /* LVGL v9：执行一次 */
+    lv_timer_set_auto_delete(t, true);    /* 执行后自动删除，回调里就不必再 delete */
+    s_switch_redraw_scr = scr;
 #endif
 }
 
@@ -761,7 +807,8 @@ static lv_obj_t *make_app_screen(const char *title)
 #define BLK_DEFAULT_PERCENT 100
 
 static uint8_t   g_brightness = BLK_DEFAULT_PERCENT;
-static lv_obj_t *g_br_label   = NULL;   /* 百分比数字标签 */
+static lv_obj_t *g_br_label   = NULL;   /* 亮度百分比数字标签 */
+static lv_obj_t *g_vol_label  = NULL;   /* 音量百分比数字标签 */
 
 /* 设置背光亮度（percent: BLK_MIN_PERCENT ~ 100） */
 static void backlight_set(uint8_t percent)
@@ -822,6 +869,16 @@ static void brightness_cb(lv_event_t *e)
     if (g_br_label) {
         lv_label_set_text_fmt(g_br_label, "%d%%", v);
     }
+}
+
+/* 音量滑块回调：audio_player 内部是软件数字增益(sample×vol/100)，
+ * set_volume 通过命令队列下发到播放任务，从 LVGL 任务调用安全。 */
+static void volume_cb(lv_event_t *e)
+{
+    lv_obj_t *sl = lv_event_get_target(e);
+    int v = lv_slider_get_value(sl);
+    audio_player_set_volume((uint8_t)v);
+    if (g_vol_label) lv_label_set_text_fmt(g_vol_label, "%d%%", v);
 }
 
 /* 设置列表里的一条手机风格分隔线（左右各留 14px 缩进） */
@@ -909,6 +966,84 @@ static void build_settings_screen(lv_obj_t *scr)
     lv_slider_set_value(sl, g_brightness, LV_ANIM_OFF);
     lv_obj_set_scrollbar_mode(sl, LV_SCROLLBAR_MODE_OFF);
     lv_obj_add_event_cb(sl, brightness_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    settings_add_separator(list);
+
+    /* ---------- 喇叭音量 ---------- */
+    lv_obj_t *vol = lv_obj_create(list);
+    lv_obj_set_width(vol, LV_PCT(100));
+    lv_obj_set_height(vol, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(vol, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_opa(vol, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_radius(vol, 0, 0);
+    lv_obj_set_style_pad_hor(vol, 14, 0);
+    lv_obj_set_style_pad_top(vol, 14, 0);
+    lv_obj_set_style_pad_bottom(vol, 14, 0);
+    lv_obj_set_style_pad_row(vol, 8, 0);
+    lv_obj_set_flex_flow(vol, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(vol, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(vol, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(vol, LV_SCROLLBAR_MODE_OFF);
+
+    lv_obj_t *vol_head = lv_obj_create(vol);
+    lv_obj_set_width(vol_head, LV_PCT(100));
+    lv_obj_set_height(vol_head, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(vol_head, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_opa(vol_head, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_radius(vol_head, 0, 0);
+    lv_obj_set_style_pad_all(vol_head, 0, 0);
+    lv_obj_set_flex_flow(vol_head, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(vol_head, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(vol_head, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(vol_head, LV_SCROLLBAR_MODE_OFF);
+
+    lv_obj_t *vcap = lv_label_create(vol_head);
+    lv_label_set_text(vcap, "喇叭音量");
+    lv_obj_set_style_text_font(vcap, &lv_font_cn_16, 0);
+    lv_obj_set_style_text_color(vcap, lv_color_white(), 0);
+
+    g_vol_label = lv_label_create(vol_head);
+    lv_label_set_text_fmt(g_vol_label, "%d%%", (int)g_audio.volume);
+    lv_obj_set_style_text_font(g_vol_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(g_vol_label, lv_color_hex(0x9AA0B5), 0);
+    lv_obj_clear_flag(g_vol_label, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t *vsl = lv_slider_create(vol);
+    lv_obj_set_width(vsl, LV_PCT(100));
+    lv_obj_set_height(vsl, 12);
+    lv_slider_set_range(vsl, 0, 100);
+    lv_slider_set_value(vsl, (int)g_audio.volume, LV_ANIM_OFF);
+    lv_obj_set_scrollbar_mode(vsl, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_add_event_cb(vsl, volume_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    settings_add_separator(list);
+
+    /* ---------- AI 聊天 Key / 平台 ---------- */
+    lv_obj_t *aikey = lv_obj_create(list);
+    lv_obj_set_width(aikey, LV_PCT(100));
+    lv_obj_set_height(aikey, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(aikey, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_opa(aikey, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_radius(aikey, 0, 0);
+    lv_obj_set_style_pad_hor(aikey, 14, 0);
+    lv_obj_set_style_pad_top(aikey, 14, 0);
+    lv_obj_set_style_pad_bottom(aikey, 14, 0);
+    lv_obj_set_flex_flow(aikey, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(aikey, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(aikey, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(aikey, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_add_event_cb(aikey, ai_key_open_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *ait = lv_label_create(aikey);
+    lv_label_set_text(ait, "AI聊天 Key / 平台");
+    lv_obj_set_style_text_font(ait, &lv_font_cn_16, 0);
+    lv_obj_set_style_text_color(ait, lv_color_white(), 0);
+    lv_obj_clear_flag(ait, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t *aichev = lv_label_create(aikey);
+    lv_label_set_text(aichev, LV_SYMBOL_RIGHT);
+    lv_obj_set_style_text_color(aichev, lv_color_hex(0x9AA0B5), 0);
+    lv_obj_clear_flag(aichev, LV_OBJ_FLAG_CLICKABLE);
 
     settings_add_separator(list);
 
@@ -1124,7 +1259,7 @@ static void build_home(void)
     lv_obj_set_scrollbar_mode(g_home, LV_SCROLLBAR_MODE_AUTO);
     /* 状态栏由 lvgl_ui_bootstrap 在 lv_layer_top() 上统一创建，不随 g_home 滚动 */
 
-    struct { const lv_image_dsc_t *icon; const char *name; lv_color_t color; int id; const char *glyph; } apps[11] = {
+    struct { const lv_image_dsc_t *icon; const char *name; lv_color_t color; int id; const char *glyph; } apps[12] = {
         { &ico_wifi,     "无线", lv_color_hex(0x2E7DE0), APP_WIFI,     NULL },
         { &ico_bluetooth,"蓝牙", lv_color_hex(0x0082FC), APP_BLE,      NULL },
         { &ico_settings, "设置", lv_color_hex(0x6B7280), APP_SETTINGS, NULL },
@@ -1136,6 +1271,7 @@ static void build_home(void)
         { &ico_pcmon,    "监控", lv_color_hex(0x2EC4B6), APP_PCMON,    NULL },
         { &ico_files,    "文件", lv_color_hex(0xF2A33C), APP_FILES,    NULL },
         { &ico_clock,    "计时器", lv_color_hex(0x5B8DEF), APP_TIMER,   "时" },
+        { NULL,          "AI聊天", lv_color_hex(0x7C5CFC), APP_AI_CHAT, "AI" },
     };
     /* 横屏 320×240：3 列 × 4 行。第 4 行靠竖直滚动翻到。 */
     const int start_x = 20, start_y = 38;
@@ -1640,16 +1776,18 @@ static void build_pwd_panel(lv_obj_t *parent)
     lv_obj_set_pos(g_pwd_ssid, 16, 6);
 
     g_pwd_ta = lv_textarea_create(g_pwd_panel);
-    lv_obj_set_size(g_pwd_ta, 288, 34);
-    lv_obj_set_pos(g_pwd_ta, 16, 26);
+    lv_obj_set_size(g_pwd_ta, 288, 26);
+    lv_obj_set_pos(g_pwd_ta, 16, 26);   /* 26~52，下方留给按钮/候选栏 */
     lv_textarea_set_one_line(g_pwd_ta, true);
     lv_textarea_set_password_mode(g_pwd_ta, true);
-    lv_textarea_set_placeholder_text(g_pwd_ta, "密码");
+    /* placeholder 用 ASCII：输入框主体字体是 montserrat_20（不含汉字），
+     * 之前写「密码」两个汉字会显示成方框。 */
+    lv_textarea_set_placeholder_text(g_pwd_ta, "Password");
     lv_obj_set_style_text_font(g_pwd_ta, &lv_font_montserrat_20, 0);
 
     lv_obj_t *ok = lv_button_create(g_pwd_panel);
-    lv_obj_set_size(ok, 92, 32);
-    lv_obj_set_pos(ok, 16, 66);
+    lv_obj_set_size(ok, 92, 28);
+    lv_obj_set_pos(ok, 16, 58);   /* 58~86，候选栏从 94 起 */
     lv_obj_set_style_bg_color(ok, lv_color_hex(0x2E7DE0), 0);
     lv_obj_t *okl = lv_label_create(ok);
     lv_label_set_text(okl, "加入");
@@ -1658,8 +1796,8 @@ static void build_pwd_panel(lv_obj_t *parent)
     lv_obj_add_event_cb(ok, pwd_ok_cb, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t *ca = lv_button_create(g_pwd_panel);
-    lv_obj_set_size(ca, 92, 32);
-    lv_obj_set_pos(ca, 120, 66);
+    lv_obj_set_size(ca, 92, 28);
+    lv_obj_set_pos(ca, 120, 58);
     lv_obj_t *cal = lv_label_create(ca);
     lv_label_set_text(cal, "取消");
     lv_obj_set_style_text_font(cal, &lv_font_cn_16, 0);
@@ -1667,9 +1805,36 @@ static void build_pwd_panel(lv_obj_t *parent)
     lv_obj_add_event_cb(ca, pwd_cancel_cb, LV_EVENT_CLICKED, NULL);
 
     g_pwd_kb = lv_keyboard_create(g_pwd_panel);
-    lv_obj_set_size(g_pwd_kb, LCD_W, 140);
+    lv_obj_set_size(g_pwd_kb, LCD_W, 120);   /* 120~240，候选栏 94~120 */
     lv_obj_align(g_pwd_kb, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_keyboard_set_textarea(g_pwd_kb, g_pwd_ta);
+
+    /* 拼音输入法：绑定后键盘支持中英文；候选栏自动浮在键盘上方。
+     * 注意 IME 必须在 set_textarea 之后创建，且它的候选面板会挂到
+     * 键盘的父容器（g_pwd_panel）上，随面板一起隐藏/显示。 */
+    g_pwd_ime = lv_ime_pinyin_create(g_pwd_panel);
+    lv_ime_pinyin_set_dict(g_pwd_ime, (lv_pinyin_dict_t *)lv_pinyin_dict_cn);
+    lv_ime_pinyin_set_keyboard(g_pwd_ime, g_pwd_kb);
+    /* 候选字按钮默认走主题字体（montserrat，不含汉字），必须显式换成中文字库，
+     * 否则拼音候选全是方框。 */
+    lv_obj_t *cand = lv_ime_pinyin_get_cand_panel(g_pwd_ime);
+    if (cand) {
+        /* 字体/颜色设在 LV_PART_ITEMS：候选字是按钮文字，设 part 0 不生效 */
+        lv_obj_set_style_text_font(cand, &lv_font_cn_16, LV_PART_ITEMS);
+        lv_obj_set_style_text_color(cand, lv_color_white(), LV_PART_ITEMS);
+        /* 绝对定位 y=94~120，键盘从 y=120 起；按钮止于 86，留 8px 缝 */
+        lv_obj_set_align(cand, LV_ALIGN_TOP_LEFT);
+        lv_obj_set_pos(cand, 8, 94);
+        lv_obj_set_size(cand, LCD_W - 16, 26);
+        lv_obj_set_style_pad_all(cand, 1, 0);
+        lv_obj_set_style_pad_gap(cand, 1, 0);
+        lv_obj_set_style_bg_color(cand, lv_color_hex(0x24242F), 0);
+        lv_obj_set_style_bg_opa(cand, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(cand, 1, 0);
+        lv_obj_set_style_border_color(cand, lv_color_hex(0x4A4A5A), 0);
+        lv_obj_set_style_radius(cand, 4, 0);
+    }
+    /* 默认 K26（26 键全键盘）即可；K9 九宫格需额外开 USE_K9_MODE，暂不用 */
 
     /* 键盘自带的“OK”键触发 textarea 的 LV_EVENT_READY、“关闭”键触发
      * LV_EVENT_CANCEL，并不会走 Join/Cancel 按钮的 LV_EVENT_CLICKED，
@@ -1876,11 +2041,13 @@ static void build_alarm_screen(lv_obj_t *scr)
 
 /* 天气刷新间隔：数据超过这个时长即视为过期，过期才重新请求 */
 #define WX_REFRESH_MS (10 * 60 * 1000)
+/* 失败 / 从未成功过时的重试退避：目标服务器不可达时单次连接要等满 15s 超时，
+ * 若无节流会变成「超时→立刻重试」死循环，占满网络任务并刷屏。 */
+#define WX_RETRY_MS  (60 * 1000)
 
 /* 只在「需要」时才请求天气，避免不必要的联网：
  *   - 不在天气界面时，周期刷新整个跳过（见 ui_weather_periodic）；
- *   - 进入界面时若数据仍然新鲜就不重复请求，来回切界面不会反复拉；
- *   - force=true 用于手动点「刷新」，无视新鲜度强制拉一次。
+ *   - force=true 用于进入界面时强制拉一次，无视新鲜度（界面无手动刷新按钮）。
  * 返回是否真的发出了请求（weather_request 只是唤醒后台任务，不阻塞）。 */
 static bool ui_weather_refresh_if_needed(bool force)
 {
@@ -1890,20 +2057,15 @@ static bool ui_weather_refresh_if_needed(bool force)
     if (g_weather.fetching) return false;
 
     uint32_t now = lv_tick_get();
-    bool stale = (now - s_last_wx_req_ms) >= WX_REFRESH_MS;
-
-    /* 非强制且数据仍新鲜，就不打扰网络（用于停留在界面时的周期刷新） */
-    if (!force && !stale && g_weather.valid) return false;
+    /* 有过成功数据时按 10 分钟刷新；从未成功/上次失败时按 60 秒退避重试。
+     * 旧写法是 (!stale && g_weather.valid)，valid=false 时守卫失效，
+     * 导致每个 UI tick 都重发请求（15s 超时 + 立即重试的刷屏死循环）。 */
+    uint32_t interval = g_weather.valid ? WX_REFRESH_MS : WX_RETRY_MS;
+    if (!force && (now - s_last_wx_req_ms) < interval) return false;
 
     weather_request(NULL);
     s_last_wx_req_ms = now;
     return true;
-}
-
-static void wx_refresh_cb(lv_event_t *e)
-{
-    (void)e;
-    ui_weather_refresh_if_needed(true);   /* 手动刷新：强制拉一次 */
 }
 
 /* ===================== 音乐播放 =====================
@@ -1916,10 +2078,15 @@ static void wx_refresh_cb(lv_event_t *e)
 #define MUSIC_MAX_FILES   64
 #define MUSIC_DIR         "/sdcard"
 
-static char       g_music_files[MUSIC_MAX_FILES][384];
+/* 路径表 64×384=24KB：从 PSRAM 分配，不占紧张的内部 DRAM。
+ * 懒分配（首次进入音乐 App 扫描时创建一次，之后复用）。 */
+static char     (*g_music_files)[384] = NULL;
 static int        g_music_count = 0;
 static int        g_music_cur   = -1;
 static uint32_t   s_music_shown_ver = 0;   /* 上次刷新过的 g_audio.version */
+static uint32_t   s_mic_shown_ver  = 0;   /* 上次刷新过的 g_mic.version */
+static uint32_t   s_mic_msg_until  = 0;   /* 录音提示显示到何时，过后恢复曲名 */
+static char       s_mic_msg[40]    = "";  /* 提示文本（UI 侧自有，避免被 audio 刷新冲掉） */
 static lv_timer_t *s_music_timer = NULL;
 static char       s_music_pending_path[384];  /* 文件管理器请求播放的路径 */
 static bool       s_music_pending = false;
@@ -1931,6 +2098,8 @@ static lv_obj_t  *g_music_time_r = NULL;   /* 进度条右侧：总时长 */
 static lv_obj_t  *g_music_play_btn = NULL;
 static lv_obj_t  *g_music_play_lbl = NULL;
 static lv_obj_t  *g_music_vol_slider = NULL;
+static lv_obj_t  *g_mic_btn = NULL;
+static lv_obj_t  *g_mic_btn_lbl = NULL;
 
 static const char *music_base(const char *p)
 {
@@ -1944,6 +2113,15 @@ static void music_scan(void)
 {
     g_music_count = 0;
     g_music_cur   = -1;
+    /* 首次使用时从 PSRAM 分配路径表（24KB），省内部 DRAM */
+    if (!g_music_files) {
+        g_music_files = heap_caps_malloc(sizeof(char[MUSIC_MAX_FILES][384]),
+                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!g_music_files) {
+            ESP_LOGE("MUSIC", "PSRAM alloc failed for file list");
+            return;
+        }
+    }
     DIR *d = opendir(MUSIC_DIR);
     if (!d) return;
     struct dirent *ent;
@@ -1954,6 +2132,27 @@ static void music_scan(void)
         g_music_count++;
     }
     closedir(d);
+}
+
+/* 录音结束后重扫列表，让新录的 WAV 出现在播放列表里。
+ * music_scan() 会把 g_music_cur 清成 -1，所以先记住当前曲名再按名字找回，
+ * 避免用户正在听第 3 首、录完音后列表选中项莫名跳回「未播放」。 */
+static void music_rescan_keep_cur(void)
+{
+    char cur[64] = "";
+    if (g_music_cur >= 0) {
+        const char *base = music_base(g_music_files[g_music_cur]);
+        snprintf(cur, sizeof(cur), "%s", base);
+    }
+    music_scan();
+    if (cur[0]) {
+        for (int i = 0; i < g_music_count; i++) {
+            if (strcmp(music_base(g_music_files[i]), cur) == 0) {
+                g_music_cur = i;
+                break;
+            }
+        }
+    }
 }
 
 /* 把后台任务的提示文本拷到普通缓冲（g_audio.hint 是 volatile char[]，
@@ -2044,6 +2243,36 @@ static void music_next_cb(lv_event_t *e)
     music_next();
 }
 
+/* 录音按钮：一次点击开始、再点停止。真正的 I2S 操作在 mic_rec 后台任务里，
+ * 这里只发命令，UI 靠 g_mic.version 轮询刷新。 */
+static void music_rec_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!mic_rec_available()) {
+        lv_label_set_text(g_music_title, "本板未引出麦克风");
+        return;
+    }
+    bool was_rec = g_mic.recording;
+    mic_rec_toggle();
+    /* 开始录音时立刻给个反馈，不等后台任务首次 publish（最多 200ms）。
+     * 写进 s_mic_msg + 计时窗口，music_timer_cb 会在窗口内保持显示它，
+     * 不会被同一轮的 g_audio 刷新冲掉。 */
+    if (!was_rec) {
+        snprintf(s_mic_msg, sizeof(s_mic_msg), "正在启动录音...");
+        s_mic_msg_until = lv_tick_get() + 3000;
+        lv_label_set_text(g_music_title, s_mic_msg);
+        if (g_mic_btn_lbl) lv_label_set_text(g_mic_btn_lbl, "停止");
+    }
+}
+
+/* volatile char[] → 普通缓冲，避免把 volatile 指针传给 LVGL */
+static void mic_copy_hint(char *dst, size_t cap)
+{
+    size_t i = 0;
+    for (; i + 1 < cap && g_mic.hint[i]; i++) dst[i] = g_mic.hint[i];
+    dst[i] = '\0';
+}
+
 static void music_toggle_cb(lv_event_t *e)
 {
     (void)e;
@@ -2068,25 +2297,72 @@ static void music_toggle_cb(lv_event_t *e)
 static void music_timer_cb(lv_timer_t *t)
 {
     (void)t;
-    if (g_audio.version == s_music_shown_ver) return;
-    s_music_shown_ver = g_audio.version;
+    bool mic_changed = (g_mic.version != s_mic_shown_ver);
+    bool aud_changed = (g_audio.version != s_music_shown_ver);
+    bool msg_expired = (s_mic_msg_until != 0 &&
+                        (int32_t)(lv_tick_get() - s_mic_msg_until) >= 0);
+    if (!mic_changed && !aud_changed && !msg_expired) return;
 
-    music_update_title();
-    music_update_time();
+    /* ---- 录音状态 ---- */
+    if (mic_changed) {
+        s_mic_shown_ver = g_mic.version;
+        if (g_mic_btn_lbl)
+            lv_label_set_text(g_mic_btn_lbl, g_mic.recording ? "停止" : "录音");
+        if (g_mic_btn)
+            lv_obj_set_style_bg_color(g_mic_btn,
+                lv_color_hex(g_mic.recording ? 0xC0392B : 0x3457A6), 0);
 
-    uint32_t dur = g_audio.dur_ms;
-    int pct = dur ? (int)(((uint64_t)g_audio.pos_ms * 1000) / dur) : 0;
-    if (pct > 1000) pct = 1000;
-    /* 拖动过程中不回写，避免进度条与手指打架 */
-    if (!lv_obj_has_state(g_music_slider, LV_STATE_PRESSED))
-        lv_slider_set_value(g_music_slider, pct, LV_ANIM_OFF);
+        if (g_mic.recording) {
+            /* 正在录：曲名栏每轮显示实时状态，不需要提示窗口 */
+            s_mic_msg_until = 0;
+        } else {
+            char h[40];
+            mic_copy_hint(h, sizeof(h));
+            if (h[0] && strcmp(s_mic_msg, h) != 0) {
+                /* 只在提示内容变化时重置窗口。录音中 version 每 200ms 变一次，
+                 * 若每次都续期，提示会永远不消失。 */
+                snprintf(s_mic_msg, sizeof(s_mic_msg), "%s", h);
+                s_mic_msg_until = lv_tick_get() + 3000;
+            }
+        }
+        if (g_mic.done) {
+            mic_rec_ack_done();
+            music_rescan_keep_cur();   /* 新录的 WAV 加入播放列表 */
+        }
+    }
+    if (msg_expired) s_mic_msg_until = 0;
 
-    if (g_music_play_lbl)
-        lv_label_set_text(g_music_play_lbl, g_audio.playing ? "暂停" : "播放");
+    /* ---- 播放状态 ---- */
+    if (aud_changed) {
+        s_music_shown_ver = g_audio.version;
+        music_update_time();
+        uint32_t dur = g_audio.dur_ms;
+        int pct = dur ? (int)(((uint64_t)g_audio.pos_ms * 1000) / dur) : 0;
+        if (pct > 1000) pct = 1000;
+        /* 拖动过程中不回写，避免进度条与手指打架；录音时进度条借作电平条 */
+        if (!g_mic.recording && !lv_obj_has_state(g_music_slider, LV_STATE_PRESSED))
+            lv_slider_set_value(g_music_slider, pct, LV_ANIM_OFF);
+        if (g_music_play_lbl)
+            lv_label_set_text(g_music_play_lbl, g_audio.playing ? "暂停" : "播放");
+        /* 录音时禁止自动切歌：否则播放被停掉后的残留 eof 会把曲名栏抢走 */
+        if (g_audio.eof && !g_mic.recording) {
+            audio_player_ack_eof();  /* 先确认，避免重复触发自动下一首 */
+            music_next();
+        }
+    }
 
-    if (g_audio.eof) {
-        audio_player_ack_eof();      /* 先确认，避免重复触发自动下一首 */
-        music_next();
+    /* ---- 曲名栏：录音实时状态 > 提示窗口 > 曲名 ---- */
+    if (g_mic.recording) {
+        char b[40];
+        unsigned sec = g_mic.elapsed_ms / 1000;
+        snprintf(b, sizeof(b), "录音中 %u:%02u  电平 %u%%",
+                 (unsigned)(sec / 60), (unsigned)(sec % 60), (unsigned)g_mic.peak);
+        lv_label_set_text(g_music_title, b);
+        lv_slider_set_value(g_music_slider, (int)g_mic.peak * 10, LV_ANIM_OFF);
+    } else if (s_mic_msg_until != 0) {
+        lv_label_set_text(g_music_title, s_mic_msg);
+    } else {
+        music_update_title();        /* 提示到期，恢复曲名 */
     }
 }
 
@@ -2194,7 +2470,9 @@ static void build_music_screen(lv_obj_t *parent)
     lv_obj_set_style_height(g_music_vol_slider, 10, LV_PART_KNOB);
     lv_obj_add_event_cb(g_music_vol_slider, music_vol_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
-    /* 控制按钮行：上一首 / 播放暂停 / 下一首（无列表，纯播放控制） */
+    /* 控制按钮行：上一首 / 播放暂停 / 下一首 / 录音。
+     * 原来 3 个按钮是 84+104+84=272 + 16×2=304，刚好占满 320。
+     * 加第 4 个后统一缩到 70 宽：70×4 + 8×3 = 304，仍是同样布局。 */
     lv_obj_t *row = lv_obj_create(parent);
     lv_obj_set_size(row, LCD_W, 34);
     lv_obj_align(row, LV_ALIGN_TOP_MID, 0, 206);
@@ -2203,26 +2481,34 @@ static void build_music_screen(lv_obj_t *parent)
     lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_style_pad_column(row, 16, 0);
+    lv_obj_set_style_pad_column(row, 8, 0);
 
-    music_make_btn(row, "上一首", music_prev_cb);
+    lv_obj_t *b_tmp = music_make_btn(row, "上一首", music_prev_cb);
+    lv_obj_set_width(b_tmp, 70);
     g_music_play_btn = music_make_btn(row, "播放", music_toggle_cb);
-    lv_obj_set_width(g_music_play_btn, 104);
+    lv_obj_set_width(g_music_play_btn, 70);
     lv_obj_set_style_bg_color(g_music_play_btn, lv_color_hex(0x2BB673), 0);  /* 主题色突出 */
     g_music_play_lbl = lv_obj_get_child(g_music_play_btn, 0);
-    music_make_btn(row, "下一首", music_next_cb);
+    b_tmp = music_make_btn(row, "下一首", music_next_cb);
+    lv_obj_set_width(b_tmp, 70);
 
-    /* 状态轮询定时器：每 200ms 检查 g_audio.version，变化才刷新进度/按钮/自动下一首 */
+    g_mic_btn = music_make_btn(row, mic_rec_available() ? "录音" : "无麦", music_rec_cb);
+    lv_obj_set_width(g_mic_btn, 70);
+    lv_obj_set_style_bg_color(g_mic_btn, lv_color_hex(0x3457A6), 0);
+    g_mic_btn_lbl = lv_obj_get_child(g_mic_btn, 0);
+    if (!mic_rec_available()) lv_obj_add_state(g_mic_btn, LV_STATE_DISABLED);
+
+    /* 状态轮询定时器：每 200ms 检查 g_audio / g_mic 的 version，变化才刷新 */
     if (!s_music_timer) s_music_timer = lv_timer_create(music_timer_cb, 200, NULL);
 }
 
 static void build_weather_screen(lv_obj_t *parent)
 {
-    /* 内容容器：放在标题栏(22~62)之下、底部按钮之上，用纵向 flex 自动堆叠 5 个标签。
-     * 用 flex 而非固定坐标，可按各标签真实行高排布并保留固定间距，避免重叠。 */
+    /* 内容容器：标题栏(22~62)之下、底部按钮之上，纵向 flex 堆叠 5 行。
+     * 只留核心信息（城市/温度天气/温区风/湿度空气/更新），避免内容过多溢出。 */
     lv_obj_t *cont = lv_obj_create(parent);
-    lv_obj_set_size(cont, LCD_W - 24, LV_SIZE_CONTENT);  /* 高度按内容自适应，避免末行溢出压到按钮 */
-    lv_obj_align(cont, LV_ALIGN_TOP_MID, 0, 62);
+    lv_obj_set_size(cont, LCD_W - 24, LV_SIZE_CONTENT);
+    lv_obj_align(cont, LV_ALIGN_TOP_MID, 0, 66);
     lv_obj_set_style_bg_opa(cont, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_opa(cont, LV_OPA_TRANSP, 0);
     lv_obj_set_style_shadow_opa(cont, LV_OPA_TRANSP, 0);
@@ -2231,43 +2517,552 @@ static void build_weather_screen(lv_obj_t *parent)
     lv_obj_clear_flag(cont, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_flex_flow(cont, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(cont, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_row(cont, 4, 0);   /* 标签之间的竖直间距 */
+    lv_obj_set_style_pad_row(cont, 6, 0);   /* 5 行，间距放宽更透气 */
 
     g_wx_city = lv_label_create(cont);
     lv_obj_set_style_text_font(g_wx_city, &lv_font_montserrat_20, 0);
     lv_obj_set_style_text_color(g_wx_city, lv_color_white(), 0);
     lv_label_set_text(g_wx_city, "--");
 
-    g_wx_temp = lv_label_create(cont);
+    g_wx_temp = lv_label_create(cont);   /* 温度 + 天气合并一行 */
     lv_obj_set_style_text_font(g_wx_temp, &lv_font_cn_16, 0);
     lv_obj_set_style_text_color(g_wx_temp, lv_color_white(), 0);
-    lv_label_set_text(g_wx_temp, "--.- C");
+    lv_label_set_text(g_wx_temp, "--.- °C  --");
 
-    g_wx_desc = lv_label_create(cont);
-    lv_obj_set_style_text_font(g_wx_desc, &lv_font_cn_16, 0);
-    lv_obj_set_style_text_color(g_wx_desc, lv_color_hex(0xCCCCCC), 0);
-    lv_label_set_text(g_wx_desc, "...");
-
-    g_wx_extra = lv_label_create(cont);
+    g_wx_extra = lv_label_create(cont);  /* 今日温区 + 风向风力 */
     lv_obj_set_style_text_font(g_wx_extra, &lv_font_cn_16, 0);
-    lv_obj_set_style_text_color(g_wx_extra, lv_color_hex(0xAAAAAA), 0);
-    lv_label_set_text(g_wx_extra, "湿度 --%   风速 -- km/h");
+    lv_obj_set_style_text_color(g_wx_extra, lv_color_hex(0xCCCCCC), 0);
+    lv_label_set_text(g_wx_extra, "今日 --~-- °C  --风 --级");
+
+    g_wx_air = lv_label_create(cont);    /* 湿度 + 空气质量 */
+    lv_obj_set_style_text_font(g_wx_air, &lv_font_cn_16, 0);
+    lv_obj_set_style_text_color(g_wx_air, lv_color_hex(0xAAAAAA), 0);
+    lv_label_set_text(g_wx_air, "湿度 --%  空气 --  PM2.5 --");
 
     g_wx_updated = lv_label_create(cont);
     lv_obj_set_style_text_font(g_wx_updated, &lv_font_cn_16, 0);
     lv_obj_set_style_text_color(g_wx_updated, lv_color_hex(0x888888), 0);
     lv_label_set_text(g_wx_updated, "尚未获取");
+    /* 无刷新按钮：进入天气屏自动拉一次(见 APP_WEATHER 分支)，之后 10 分钟周期刷新 */
+}
 
-    /* 底部刷新按钮（独立于内容容器，固定在屏幕底部） */
-    lv_obj_t *rf = lv_button_create(parent);
-    lv_obj_set_size(rf, 140, 34);
-    lv_obj_align(rf, LV_ALIGN_BOTTOM_MID, 0, -14);
-    lv_obj_set_style_bg_color(rf, lv_color_hex(0x2E7DE0), 0);
-    lv_obj_t *rl = lv_label_create(rf);
-    lv_label_set_text(rl, "刷新");
-    lv_obj_set_style_text_font(rl, &lv_font_cn_16, 0);
-    lv_obj_center(rl);
-    lv_obj_add_event_cb(rf, wx_refresh_cb, LV_EVENT_CLICKED, NULL);
+/* ===================== AI 聊天屏 =====================
+ * 消息列表只显示最近一次问答（省 RAM）：上方是问题，下方是回复。
+ * 输入框 + 拼音键盘复用 WiFi 密码页的方案；Key 存在 NVS，设置浮层可改。 */
+
+/* 拷 volatile 文本（g_ai.reply 由后台任务写）到普通缓冲，保住 volatile 语义 */
+static void ai_copy_volatile(const volatile char *src, char *dst, size_t cap)
+{
+    size_t n = 0;
+    if (src) while (n < cap - 1 && src[n]) { dst[n] = (char)src[n]; n++; }
+    dst[n] = '\0';
+}
+
+/* 微信式气泡：is_user=true 靠右绿色，false 靠左深灰。返回气泡对象供复用。
+ * text 是 volatile，先拷到局部。每行一个行容器 + 一个气泡 + 一个 label，
+ * 消息列表用 flex column 自动往下排，不再重叠。 */
+static lv_obj_t *ai_add_bubble(const volatile char *text, bool is_user, lv_color_t text_color)
+{
+    if (!g_ai_chat_box) return NULL;
+    char buf[512];
+    ai_copy_volatile(text, buf, sizeof(buf));
+
+    /* 行容器：整行宽、高自适应，透明无边框 */
+    lv_obj_t *row = lv_obj_create(g_ai_chat_box);
+    lv_obj_set_width(row, LV_PCT(100));
+    lv_obj_set_height(row, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_opa(row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_pad_all(row, 0, 0);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* 气泡：宽度按内容自适应但设最大宽，圆角，用户/AI 不同底色 */
+    lv_obj_t *bub = lv_obj_create(row);
+    lv_obj_set_width(bub, LV_SIZE_CONTENT);
+    lv_obj_set_style_max_width(bub, LCD_W - 60, 0);
+    lv_obj_set_height(bub, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_color(bub, is_user ? lv_color_hex(0x2E7DE0) : lv_color_hex(0x2A2A38), 0);
+    lv_obj_set_style_radius(bub, 8, 0);
+    lv_obj_set_style_border_opa(bub, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_pad_all(bub, 6, 0);
+    lv_obj_set_style_pad_gap(bub, 0, 0);
+    lv_obj_clear_flag(bub, LV_OBJ_FLAG_SCROLLABLE);
+    if (is_user) lv_obj_align(bub, LV_ALIGN_RIGHT_MID, 0, 0);
+    else         lv_obj_align(bub, LV_ALIGN_LEFT_MID, 0, 0);
+
+    /* 气泡内文字：自动换行、中文字库、按传入色（错误时红） */
+    lv_obj_t *lab = lv_label_create(bub);
+    lv_obj_set_width(lab, LV_SIZE_CONTENT);
+    lv_obj_set_style_max_width(lab, LCD_W - 72, 0);
+    lv_label_set_long_mode(lab, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(lab, &lv_font_cn_16, 0);
+    lv_obj_set_style_text_color(lab, text_color, 0);
+    lv_label_set_text(lab, buf);
+
+    lv_obj_scroll_to_y(g_ai_chat_box, LV_COORD_MAX, LV_ANIM_OFF);
+    return lab;   /* 返回 label 便于更新「思考中」 */
+}
+
+/* 兼容旧调用：按 who 判断左右，颜色由调用方给 */
+static void ai_add_msg(const char *who, const volatile char *text, lv_color_t color)
+{
+    bool is_user = (who && strcmp(who, "我") == 0);
+    ai_add_bubble(text, is_user, color);
+}
+
+/* 退出输入态：收起键盘、隐藏候选栏、输入框回到底部、恢复列表和按钮行。
+ * 发送和「收起键盘」都走这里，保证布局一致。 */
+static void ai_leave_input_mode(void)
+{
+    if (g_ai_kb) {
+        lv_keyboard_set_textarea(g_ai_kb, NULL);
+        lv_obj_add_flag(g_ai_kb, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (g_ai_ime) {
+        lv_obj_t *cand = lv_ime_pinyin_get_cand_panel(g_ai_ime);
+        if (cand) lv_obj_add_flag(cand, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (g_ai_kb_cancel) lv_obj_add_flag(g_ai_kb_cancel, LV_OBJ_FLAG_HIDDEN);
+    if (g_ai_ta) {
+        lv_obj_set_align(g_ai_ta, LV_ALIGN_BOTTOM_LEFT);
+        lv_obj_set_pos(g_ai_ta, 8, -8);
+    }
+    if (g_ai_chat_box) lv_obj_clear_flag(g_ai_chat_box, LV_OBJ_FLAG_HIDDEN);
+    if (g_ai_bar)      lv_obj_clear_flag(g_ai_bar, LV_OBJ_FLAG_HIDDEN);
+}
+
+/* 「收起键盘」按钮：放弃输入态但保留已输入的文字，方便下次接着写 */
+static void ai_kb_cancel_cb(lv_event_t *e)
+{
+    (void)e;
+    ai_leave_input_mode();
+}
+
+/* 发送按钮 / 键盘 READY 共用 */
+static void ai_send_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!g_ai_ta || g_ai.busy) return;
+    const char *q = lv_textarea_get_text(g_ai_ta);
+    if (!q || !q[0]) return;
+    ai_add_msg("我", q, lv_color_white());
+    ai_chat_ask(q);                 /* 后台复制问题，异步请求 */
+    lv_textarea_set_text(g_ai_ta, "");
+    ai_leave_input_mode();
+    /* 建一个「思考中」气泡并记住它的 label；回复到达时直接改文字，
+     * 不再追加新气泡——这样才像微信的一问一答，不会越积越多。 */
+    g_ai_thinking_bubble = ai_add_bubble("思考中...", false, lv_color_hex(0x9AA0B5));
+}
+
+/* Key 设置浮层：保存 / 取消 */
+/* 收起 Key 浮层的键盘（保留浮层和已输入内容） */
+static void ai_key_kb_hide(void)
+{
+    if (g_ai_key_kb) {
+        lv_keyboard_set_textarea(g_ai_key_kb, NULL);
+        lv_obj_add_flag(g_ai_key_kb, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void ai_key_kb_hide_cb(lv_event_t *e)
+{
+    (void)e;
+    ai_key_kb_hide();
+}
+
+/* 点 Key 输入框才弹键盘，平时收起，不遮挡下方按钮 */
+static void ai_key_ta_focus_cb(lv_event_t *e)
+{
+    (void)e;
+    if (g_ai_key_kb) {
+        lv_obj_clear_flag(g_ai_key_kb, LV_OBJ_FLAG_HIDDEN);
+        lv_keyboard_set_textarea(g_ai_key_kb, g_ai_key_ta);
+    }
+}
+
+static void ai_key_save_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!g_ai_key_ta) return;
+    const char *k = lv_textarea_get_text(g_ai_key_ta);
+    if (k && k[0]) {
+        ai_chat_key_set(k);
+        ai_chat_cfg_sync();   /* LVGL 任务栈在内部 RAM，同步给 PSRAM 后台任务 */
+        ESP_LOGI("AI", "API key saved (%u chars)", (unsigned)strlen(k));
+    }
+    ai_key_kb_hide();
+    if (g_ai_key_panel) lv_obj_add_flag(g_ai_key_panel, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void ai_key_cancel_cb(lv_event_t *e)
+{
+    (void)e;
+    ai_key_kb_hide();
+    if (g_ai_key_panel) lv_obj_add_flag(g_ai_key_panel, LV_OBJ_FLAG_HIDDEN);
+}
+
+/* 刷新 Key 浮层标题（显示当前平台名） */
+static void ai_key_title_refresh(void)
+{
+    if (!g_ai_key_title) return;
+    ai_provider_t p = ai_chat_provider_get();
+    lv_label_set_text_fmt(g_ai_key_title, "%s API Key", ai_chat_provider_name(p));
+}
+
+/* 点击循环切换平台：智谱 → DeepSeek → 硅基流动 → 智谱。
+ * 平台立即存 NVS，每个平台的 Key 独立存储，切换后输入框载入对应 Key。 */
+static void ai_key_switch_cb(lv_event_t *e)
+{
+    (void)e;
+    ai_provider_t p = ai_chat_provider_get();
+    p = (ai_provider_t)((p + 1) % AI_PROVIDER_MAX);
+    ai_chat_provider_set(p);
+    ai_chat_cfg_sync();   /* 同步给 PSRAM 后台任务 */
+    ai_key_title_refresh();
+    char key[96];
+    key[0] = '\0';
+    ai_chat_key_get(key, sizeof(key));
+    lv_textarea_set_text(g_ai_key_ta, key);
+    ESP_LOGI("AI", "provider switched to %s", ai_chat_provider_name(p));
+}
+
+static void ai_key_open_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!g_ai_key_panel) return;
+    ai_key_title_refresh();
+    /* 从输入态直接点 Key 时先复位聊天屏布局（Key 浮层有自己的键盘） */
+    if (g_ai_kb) {
+        lv_keyboard_set_textarea(g_ai_kb, NULL);
+        lv_obj_add_flag(g_ai_kb, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (g_ai_ime) {
+        lv_obj_t *cand = lv_ime_pinyin_get_cand_panel(g_ai_ime);
+        if (cand) lv_obj_add_flag(cand, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (g_ai_chat_box) lv_obj_clear_flag(g_ai_chat_box, LV_OBJ_FLAG_HIDDEN);
+    if (g_ai_bar)      lv_obj_clear_flag(g_ai_bar, LV_OBJ_FLAG_HIDDEN);
+    /* 打开即显示 Key 键盘并绑定输入框：浮层里的 textarea 不会自动触发
+     * LV_EVENT_FOCUSED，光靠 focus 回调会导致「键盘根本出不来」。 */
+    if (g_ai_key_kb) {
+        lv_obj_clear_flag(g_ai_key_kb, LV_OBJ_FLAG_HIDDEN);
+        lv_keyboard_set_textarea(g_ai_key_kb, g_ai_key_ta);
+        lv_obj_move_foreground(g_ai_key_kb);   /* 在浮层之上，别被浮层盖住 */
+    }
+    char key[96];
+    key[0] = '\0';
+    ai_chat_key_get(key, sizeof(key));
+    lv_textarea_set_text(g_ai_key_ta, key);
+    lv_obj_clear_flag(g_ai_key_panel, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void ai_clear_cb(lv_event_t *e)
+{
+    (void)e;
+    g_ai_thinking_bubble = NULL;   /* 气泡已被 clean，句柄失效 */
+    if (g_ai_chat_box) lv_obj_clean(g_ai_chat_box);
+}
+
+/* 语音按钮：点一下开始录音，再点一下停止并触发识别。
+ * 录音期间按钮文字变「停止」，识别期间变「识别中」，由 ui_voice_refresh 更新。 */
+static void ai_voice_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!mic_rec_available()) {
+        if (g_ai_voice_lbl) lv_label_set_text(g_ai_voice_lbl, "无麦克风");
+        return;
+    }
+    if (voice_asr_is_busy()) return;   /* 识别中，忽略点击 */
+    if (mic_rec_is_recording()) {
+        mic_rec_stop();                /* 停止 → 录完自动写 WAV */
+        if (g_ai_voice_lbl) lv_label_set_text(g_ai_voice_lbl, "处理中");
+    } else {
+        if (!sd_card_is_mounted()) {
+            if (g_ai_voice_lbl) lv_label_set_text(g_ai_voice_lbl, "无SD卡");
+            return;
+        }
+        mic_rec_start();               /* 开始录音 */
+        if (g_ai_voice_lbl) lv_label_set_text(g_ai_voice_lbl, "停止");
+    }
+}
+
+/* 主循环调用：录音完成 → 自动发 ASR；识别完成 → 文字填入输入框 */
+static void ui_voice_refresh(void)
+{
+    if (!g_ai_screen || lv_screen_active() != g_ai_screen) return;
+
+    /* 录音刚完成：拿 WAV 路径发识别 */
+    if (g_mic.done) {
+        if (g_mic.last_path[0]) {
+            char path[160];
+            size_t i = 0;
+            while (i + 1 < sizeof(path) && g_mic.last_path[i]) {
+                path[i] = (char)g_mic.last_path[i]; i++;
+            }
+            path[i] = '\0';
+            if (g_ai_voice_lbl) lv_label_set_text(g_ai_voice_lbl, "识别中");
+            voice_asr_start(path);
+        }
+        mic_rec_ack_done();
+    }
+
+    if (g_asr.version == s_asr_shown_ver) return;
+    s_asr_shown_ver = g_asr.version;
+
+    if (g_asr.done) {
+        /* 识别文字填入输入框，用户确认/修改后再点发送 */
+        char txt[sizeof(g_asr.text)];
+        size_t i = 0;
+        while (i + 1 < sizeof(txt) && g_asr.text[i]) { txt[i] = (char)g_asr.text[i]; i++; }
+        txt[i] = '\0';
+        if (g_ai_ta) lv_textarea_set_text(g_ai_ta, txt);
+        voice_asr_ack_done();
+        if (g_ai_voice_lbl) lv_label_set_text(g_ai_voice_lbl, "语音");
+    } else if (!g_asr.busy && g_asr.hint[0] && g_ai_voice_lbl) {
+        char hint[sizeof(g_asr.hint)];
+        size_t i = 0;
+        while (i + 1 < sizeof(hint) && g_asr.hint[i]) { hint[i] = (char)g_asr.hint[i]; i++; }
+        hint[i] = '\0';
+        lv_label_set_text(g_ai_voice_lbl, hint);
+    }
+}
+
+/* 输入框获得焦点时进入输入态。三段式布局，全部用绝对坐标锁死、互不重叠：
+ *   输入框  y=62~88  (26px)
+ *   候选栏  y=94~120 (26px，独立一条，左右留边)
+ *   键盘    y=120~240
+ * 中间 6px 间隙把输入框和候选栏彻底隔开。 */
+static void ai_ta_focus_cb(lv_event_t *e)
+{
+    (void)e;
+    if (g_ai_bar)      lv_obj_add_flag(g_ai_bar, LV_OBJ_FLAG_HIDDEN);
+    if (g_ai_chat_box) lv_obj_add_flag(g_ai_chat_box, LV_OBJ_FLAG_HIDDEN);
+    if (g_ai_ta) {
+        lv_obj_set_align(g_ai_ta, LV_ALIGN_TOP_LEFT);
+        lv_obj_set_pos(g_ai_ta, 8, 62);
+    }
+    if (g_ai_kb_cancel) lv_obj_clear_flag(g_ai_kb_cancel, LV_OBJ_FLAG_HIDDEN);
+    if (g_ai_kb) {
+        lv_obj_clear_flag(g_ai_kb, LV_OBJ_FLAG_HIDDEN);
+        lv_keyboard_set_textarea(g_ai_kb, g_ai_ta);
+    }
+}
+
+static void build_ai_chat_screen(lv_obj_t *parent)
+{
+    /* ---- 顶部：「语音」+「清空」（Key 已移到设置页） ---- */
+    lv_obj_t *bar = g_ai_bar = lv_obj_create(parent);
+    lv_obj_set_size(bar, LCD_W - 16, 28);
+    lv_obj_align(bar, LV_ALIGN_TOP_MID, 0, 64);
+    /* 与 scr 同色不透明：PARTIAL 模式下透明容器不绘制，切换时会透出旧屏残影 */
+    lv_obj_set_style_bg_color(bar, lv_color_hex(0x101018), 0);
+    lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_opa(bar, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_pad_all(bar, 0, 0);
+    lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* 语音输入按钮：点开始录音，再点停止并识别；文字随状态变化 */
+    g_ai_voice_btn = lv_button_create(bar);
+    lv_obj_set_size(g_ai_voice_btn, 96, 26);
+    lv_obj_align(g_ai_voice_btn, LV_ALIGN_LEFT_MID, 0, 0);
+    lv_obj_set_style_bg_color(g_ai_voice_btn, lv_color_hex(0x2BB673), 0);
+    g_ai_voice_lbl = lv_label_create(g_ai_voice_btn);
+    lv_label_set_text(g_ai_voice_lbl, mic_rec_available() ? "语音" : "无麦");
+    lv_obj_set_style_text_font(g_ai_voice_lbl, &lv_font_cn_16, 0);
+    lv_obj_center(g_ai_voice_lbl);
+    lv_obj_add_event_cb(g_ai_voice_btn, ai_voice_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *clr = lv_button_create(bar);
+    lv_obj_set_size(clr, 72, 26);
+    lv_obj_align(clr, LV_ALIGN_RIGHT_MID, 0, 0);
+    lv_obj_set_style_bg_color(clr, lv_color_hex(0x6B7280), 0);
+    lv_obj_t *clrl = lv_label_create(clr);
+    lv_label_set_text(clrl, "清空");
+    lv_obj_set_style_text_font(clrl, &lv_font_cn_16, 0);
+    lv_obj_center(clrl);
+    lv_obj_add_event_cb(clr, ai_clear_cb, LV_EVENT_CLICKED, NULL);
+
+    /* ---- 消息列表：flex column 让每条气泡自动往下排（关键：不设 flex
+     * 所有 label 会堆在 (0,0) 重叠）。高 96px，可滚动。 ---- */
+    g_ai_chat_box = lv_obj_create(parent);
+    lv_obj_set_size(g_ai_chat_box, LCD_W - 16, 96);
+    lv_obj_align(g_ai_chat_box, LV_ALIGN_TOP_MID, 0, 100);
+    lv_obj_set_style_bg_color(g_ai_chat_box, lv_color_hex(0x16161F), 0);
+    lv_obj_set_style_border_opa(g_ai_chat_box, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_pad_all(g_ai_chat_box, 6, 0);
+    lv_obj_set_style_pad_row(g_ai_chat_box, 6, 0);
+    lv_obj_set_flex_flow(g_ai_chat_box, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(g_ai_chat_box, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_set_scrollbar_mode(g_ai_chat_box, LV_SCROLLBAR_MODE_AUTO);
+
+    /* 欢迎语 */
+    ai_add_msg("AI", ai_chat_key_has() ? "你好，请问想聊什么？" : "请先点上方 API Key 填入密钥（默认免费智谱GLM）",
+               lv_color_hex(0xCCCCCC));
+
+    /* ---- 底部：输入框 + 发送键 ---- */
+    g_ai_ta = lv_textarea_create(parent);
+    lv_obj_set_size(g_ai_ta, LCD_W - 84, 26);
+    lv_obj_align(g_ai_ta, LV_ALIGN_BOTTOM_LEFT, 8, -8);
+    lv_textarea_set_one_line(g_ai_ta, true);
+    lv_textarea_set_placeholder_text(g_ai_ta, "输入消息");
+    lv_obj_set_style_text_font(g_ai_ta, &lv_font_cn_16, 0);
+    lv_obj_add_event_cb(g_ai_ta, ai_send_cb, LV_EVENT_READY, NULL);
+    lv_obj_add_event_cb(g_ai_ta, ai_ta_focus_cb, LV_EVENT_FOCUSED, NULL);
+
+    lv_obj_t *send = lv_button_create(parent);
+    lv_obj_set_size(send, 64, 34);
+    lv_obj_align(send, LV_ALIGN_BOTTOM_RIGHT, -8, -8);
+    lv_obj_set_style_bg_color(send, lv_color_hex(0x2E7DE0), 0);
+    lv_obj_t *sendl = lv_label_create(send);
+    lv_label_set_text(sendl, "发送");
+    lv_obj_set_style_text_font(sendl, &lv_font_cn_16, 0);
+    lv_obj_center(sendl);
+    lv_obj_add_event_cb(send, ai_send_cb, LV_EVENT_CLICKED, NULL);
+
+    /* ---- 拼音键盘（默认隐藏，输入框聚焦时弹出） ---- */
+    g_ai_kb = lv_keyboard_create(parent);
+    lv_obj_set_size(g_ai_kb, LCD_W, 120);
+    lv_obj_align(g_ai_kb, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_add_flag(g_ai_kb, LV_OBJ_FLAG_HIDDEN);
+    g_ai_ime = lv_ime_pinyin_create(parent);
+    lv_ime_pinyin_set_dict(g_ai_ime, (lv_pinyin_dict_t *)lv_pinyin_dict_cn);
+    lv_ime_pinyin_set_keyboard(g_ai_ime, g_ai_kb);
+    lv_obj_t *cand = lv_ime_pinyin_get_cand_panel(g_ai_ime);
+    if (cand) {
+        /* 候选字是 buttonmatrix 的按钮文字，用 LV_PART_ITEMS 的字体绘制；
+         * 设在 part 0 不生效，会回退到不含汉字的默认字体 → 一片方框。 */
+        lv_obj_set_style_text_font(cand, &lv_font_cn_16, LV_PART_ITEMS);
+        lv_obj_set_style_text_color(cand, lv_color_white(), LV_PART_ITEMS);
+        lv_obj_set_style_bg_color(cand, lv_color_hex(0x24242F), 0);
+        lv_obj_set_style_bg_opa(cand, LV_OPA_COVER, 0);
+        /* 绝对定位锁死候选栏 y=94~120，不依赖 align_to（它会因 set_keyboard
+         * 内按 12px 算过的位置而在改高度后错位）。左右留 8px，独立成一条。 */
+        lv_obj_set_align(cand, LV_ALIGN_TOP_LEFT);
+        lv_obj_set_pos(cand, 8, 94);
+        lv_obj_set_size(cand, LCD_W - 16, 26);
+        lv_obj_set_style_pad_all(cand, 1, 0);
+        lv_obj_set_style_pad_gap(cand, 1, 0);
+        lv_obj_set_style_border_width(cand, 1, 0);
+        lv_obj_set_style_border_color(cand, lv_color_hex(0x4A4A5A), 0);
+        lv_obj_set_style_radius(cand, 4, 0);
+    }
+
+    /* 输入态的「收起键盘」按钮：放在输入框右侧，默认隐藏 */
+    g_ai_kb_cancel = lv_button_create(parent);
+    lv_obj_set_size(g_ai_kb_cancel, 60, 26);
+    lv_obj_set_align(g_ai_kb_cancel, LV_ALIGN_TOP_LEFT);
+    lv_obj_set_pos(g_ai_kb_cancel, 8 + (LCD_W - 84) + 4, 62);
+    lv_obj_set_style_bg_color(g_ai_kb_cancel, lv_color_hex(0x6B7280), 0);
+    lv_obj_t *kb_cancel_lbl = lv_label_create(g_ai_kb_cancel);
+    lv_label_set_text(kb_cancel_lbl, "收起");
+    lv_obj_set_style_text_font(kb_cancel_lbl, &lv_font_cn_16, 0);
+    lv_obj_center(kb_cancel_lbl);
+    lv_obj_add_event_cb(g_ai_kb_cancel, ai_kb_cancel_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_flag(g_ai_kb_cancel, LV_OBJ_FLAG_HIDDEN);
+
+    /* API Key 浮层已从聊天屏移出，改为全局顶层浮层 build_ai_key_panel()
+     * 在 bootstrap 里创建——这样设置屏也能直接打开，不必先进入聊天屏。 */
+}
+
+/* 主循环调用：只在 AI 屏可见且 version 变化时刷新最新回复 */
+static void ui_ai_screen_refresh(void)
+{
+    if (!g_ai_screen || lv_screen_active() != g_ai_screen || !g_ai_chat_box) return;
+    if (g_ai.version == s_ai_shown_ver) return;
+    s_ai_shown_ver = g_ai.version;
+
+    char buf[512];
+    ai_copy_volatile(g_ai.reply, buf, sizeof(buf));
+    if (g_ai_thinking_bubble && lv_obj_is_valid(g_ai_thinking_bubble)) {
+        /* 直接把「思考中」气泡改成回复文字，按错误与否换色 */
+        lv_label_set_text(g_ai_thinking_bubble, buf);
+        lv_obj_set_style_text_color(g_ai_thinking_bubble,
+            g_ai.error ? lv_color_hex(0xFF8B85) : lv_color_white(), 0);
+        g_ai_thinking_bubble = NULL;
+        lv_obj_scroll_to_y(g_ai_chat_box, LV_COORD_MAX, LV_ANIM_OFF);
+    } else {
+        /* 没有待更新气泡（如进屏对齐后收到新消息），新建一条 AI 气泡 */
+        ai_add_bubble(buf, false, g_ai.error ? lv_color_hex(0xFF8B85) : lv_color_white());
+    }
+}
+
+/* API Key 设置浮层：全局挂在 lv_layer_top()，任何屏都能打开。
+ * 由 lvgl_ui_bootstrap() 创建一次；入口在「设置」页，聊天屏不再放 Key 按钮。 */
+static void build_ai_key_panel(void)
+{
+    g_ai_key_panel = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(g_ai_key_panel, LCD_W, LCD_H);
+    lv_obj_set_pos(g_ai_key_panel, 0, 0);
+    lv_obj_set_style_bg_color(g_ai_key_panel, lv_color_hex(0x101018), 0);
+    lv_obj_set_style_bg_opa(g_ai_key_panel, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(g_ai_key_panel, 0, 0);
+    lv_obj_set_style_border_opa(g_ai_key_panel, LV_OPA_TRANSP, 0);
+    lv_obj_clear_flag(g_ai_key_panel, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* 控件排在键盘上方（键盘 y=144~240），互不重叠。标题含中文平台名用中文字库。 */
+    g_ai_key_title = lv_label_create(g_ai_key_panel);
+    lv_label_set_text(g_ai_key_title, "API Key");
+    lv_obj_set_style_text_font(g_ai_key_title, &lv_font_cn_16, 0);
+    lv_obj_set_pos(g_ai_key_title, 16, 24);
+    ai_key_title_refresh();
+
+    /* 切换平台：智谱 → DeepSeek → 硅基流动 */
+    g_ai_key_switch = lv_button_create(g_ai_key_panel);
+    lv_obj_set_size(g_ai_key_switch, 96, 24);
+    lv_obj_set_pos(g_ai_key_switch, LCD_W - 112, 20);
+    lv_obj_set_style_bg_color(g_ai_key_switch, lv_color_hex(0x8B5CF6), 0);
+    lv_obj_t *swl = lv_label_create(g_ai_key_switch);
+    lv_label_set_text(swl, "切换平台");
+    lv_obj_set_style_text_font(swl, &lv_font_cn_16, 0);
+    lv_obj_center(swl);
+    lv_obj_add_event_cb(g_ai_key_switch, ai_key_switch_cb, LV_EVENT_CLICKED, NULL);
+
+    /* Key 是 ASCII，标准键盘即可（无 IME/候选栏） */
+    g_ai_key_ta = lv_textarea_create(g_ai_key_panel);
+    lv_obj_set_size(g_ai_key_ta, LCD_W - 32, 32);
+    lv_obj_set_pos(g_ai_key_ta, 16, 46);
+    lv_textarea_set_one_line(g_ai_key_ta, true);
+    lv_textarea_set_text(g_ai_key_ta, "");
+    lv_obj_set_style_text_font(g_ai_key_ta, &lv_font_montserrat_16, 0);
+    lv_obj_add_event_cb(g_ai_key_ta, ai_key_ta_focus_cb, LV_EVENT_FOCUSED, NULL);
+
+    lv_obj_t *ks = lv_button_create(g_ai_key_panel);
+    lv_obj_set_size(ks, 120, 30);
+    lv_obj_set_pos(ks, 16, 86);
+    lv_obj_set_style_bg_color(ks, lv_color_hex(0x2E7DE0), 0);
+    lv_obj_t *ksl = lv_label_create(ks);
+    lv_label_set_text(ksl, "保存");
+    lv_obj_set_style_text_font(ksl, &lv_font_cn_16, 0);
+    lv_obj_center(ksl);
+    lv_obj_add_event_cb(ks, ai_key_save_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *kc = lv_button_create(g_ai_key_panel);
+    lv_obj_set_size(kc, 120, 30);
+    lv_obj_set_pos(kc, 176, 86);
+    lv_obj_t *kcl = lv_label_create(kc);
+    lv_label_set_text(kcl, "取消");
+    lv_obj_set_style_text_font(kcl, &lv_font_cn_16, 0);
+    lv_obj_center(kcl);
+    lv_obj_add_event_cb(kc, ai_key_cancel_cb, LV_EVENT_CLICKED, NULL);
+
+    /* 收起键盘按钮：键盘弹出时仍可点（y=122~142，键盘从 144 起） */
+    lv_obj_t *khh = lv_button_create(g_ai_key_panel);
+    lv_obj_set_size(khh, 120, 20);
+    lv_obj_set_pos(khh, 100, 122);
+    lv_obj_set_style_bg_color(khh, lv_color_hex(0x6B7280), 0);
+    lv_obj_t *khl = lv_label_create(khh);
+    lv_label_set_text(khl, "收起键盘");
+    lv_obj_set_style_text_font(khl, &lv_font_cn_16, 0);
+    lv_obj_center(khl);
+    lv_obj_add_event_cb(khh, ai_key_kb_hide_cb, LV_EVENT_CLICKED, NULL);
+
+    /* 浮层专用键盘：打开时由 ai_key_open_cb 主动显示 */
+    g_ai_key_kb = lv_keyboard_create(g_ai_key_panel);
+    lv_obj_set_size(g_ai_key_kb, LCD_W, 96);
+    lv_obj_align(g_ai_key_kb, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_add_flag(g_ai_key_kb, LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_add_flag(g_ai_key_panel, LV_OBJ_FLAG_HIDDEN);
 }
 
 /* ---------------- 电脑监控屏（TCP 从 PC 端 AIDA64 读取，每秒刷新） ---------------- */
@@ -2278,7 +3073,9 @@ static void build_pcmon_screen(lv_obj_t *parent)
     lv_obj_t *cont = lv_obj_create(parent);
     lv_obj_set_size(cont, LCD_W - 10, LCD_H - 86);
     lv_obj_align(cont, LV_ALIGN_TOP_MID, 0, 62);
-    lv_obj_set_style_bg_opa(cont, LV_OPA_TRANSP, 0);
+    /* 与 scr 同色不透明：PARTIAL 模式下透明容器不绘制，切换时会透出旧屏残影 */
+    lv_obj_set_style_bg_color(cont, lv_color_hex(0x101018), 0);
+    lv_obj_set_style_bg_opa(cont, LV_OPA_COVER, 0);
     lv_obj_set_style_border_opa(cont, LV_OPA_TRANSP, 0);
     lv_obj_set_style_shadow_opa(cont, LV_OPA_TRANSP, 0);
     lv_obj_set_style_radius(cont, 0, 0);
@@ -2670,8 +3467,9 @@ typedef struct {
     int   fbytes;          /* 文件字节数（日志用） */
 } novel_sd_book_t;
 
-static novel_sd_book_t g_sd_books[NOVEL_SD_MAX];
-static int             g_sd_count = 0;
+/* SD 书单 32×sizeof(novel_sd_book_t)≈14KB：从 PSRAM 分配，省内部 DRAM */
+static novel_sd_book_t *g_sd_books = NULL;
+static int              g_sd_count = 0;
 
 /* 当前阅读的书（统一访问层）：Flash 书用 flash_text，SD 书用 fp+page_off 流式读 */
 static struct {
@@ -2811,6 +3609,15 @@ static bool novel_sd_open(int j)
 static void novel_scan_sd(void)
 {
     g_sd_count = 0;
+    /* 首次使用时从 PSRAM 分配书单（≈14KB），省内部 DRAM */
+    if (!g_sd_books) {
+        g_sd_books = heap_caps_malloc(NOVEL_SD_MAX * sizeof(novel_sd_book_t),
+                                      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!g_sd_books) {
+            ESP_LOGE("NOVEL", "PSRAM alloc failed for SD book list");
+            return;
+        }
+    }
     if (!sd_card_is_mounted()) {
         ESP_LOGI("NOVEL", "SD not mounted, try mount...");
         (void)sd_card_mount(true);
@@ -3333,6 +4140,7 @@ static void lvgl_ui_bootstrap(void)
     make_status_bar(lv_layer_top());        /* 状态栏统一挂在顶层 layer，不随任何 screen 滚动/切换 */
     lvgl_fps_setup();                       /* 诊断：FPS 显示 */
     ui_alarm_popup_create();                /* 闹钟弹窗（挂在顶层 layer） */
+    build_ai_key_panel();                   /* AI Key 浮层（全局顶层，设置页入口） */
 }
 
 /* 周期刷新天气：只有当前正停留在天气界面才发请求，
@@ -3511,6 +4319,24 @@ static void ui_weather_screen_refresh(void)
     lv_obj_t *active = lv_screen_active();
     if (!g_weather_screen || active != g_weather_screen || !g_wx_temp) return;
 
+    /* 「X 秒前更新」需要每秒重绘，但下面的 changed 只在数据/状态变化时为真，
+     * 时间流逝不在其中，label 会永远停在 0。这里用独立每秒 tick 只更新这一行，
+     * 不触发整屏重绘；仅在正常数据态(valid 且非 fetching)下接管，避免覆盖
+     * 「更新中...」「获取失败」等临时文案。 */
+    {
+        static uint64_t s_ago_ms = 0;
+        uint64_t now_ms = esp_timer_get_time() / 1000;
+        if (g_weather.valid && !g_weather.fetching && now_ms - s_ago_ms >= 1000) {
+            s_ago_ms = now_ms;
+            int64_t diff_ms = (int64_t)now_ms - g_weather.updated_ms;  /* 两侧同符号，防时间回拨溢出 */
+            int ago_s = (int)(diff_ms / 1000);
+            if (ago_s < 0) ago_s = 0;
+            char b[24];
+            snprintf(b, sizeof(b), "%d 秒前更新", ago_s);
+            lv_label_set_text(g_wx_updated, b);
+        }
+    }
+
     bool changed = (g_weather.version != s_wx_shown_ver) ||
                    (g_weather.fetching != s_wx_fetching) ||
                    s_wx_need_redraw ||
@@ -3525,28 +4351,40 @@ static void ui_weather_screen_refresh(void)
     if (g_wifi_state != WIFI_STA_CONNECTED) {
         lv_label_set_text(g_wx_city, "--");
         lv_label_set_text(g_wx_temp, "--.- °C");
-        lv_label_set_text(g_wx_desc, "WiFi 未连接");
-        lv_label_set_text(g_wx_extra, "请先连接 WiFi 后点刷新");
+        lv_label_set_text(g_wx_extra, "WiFi 未连接");
+        lv_label_set_text(g_wx_air, "请先连接 WiFi 后点刷新");
         lv_label_set_text(g_wx_updated, "");
         return;
     }
-    char buf[48];
+    char buf[96];
     if (g_weather.fetching) {
         lv_label_set_text(g_wx_updated, "更新中...");
     } else if (g_weather.valid) {
         lv_label_set_text(g_wx_city, g_weather.city);
-        snprintf(buf, sizeof(buf), "%.1f °C", g_weather.temp);
+        /* 温度 + 天气合并一行 */
+        snprintf(buf, sizeof(buf), "%.1f °C  %s", g_weather.temp, g_weather.desc);
         lv_label_set_text(g_wx_temp, buf);
-        lv_label_set_text(g_wx_desc, g_weather.desc);
-        snprintf(buf, sizeof(buf), "湿度 %d%%   风速 %.1f km/h",
-                 g_weather.humidity, g_weather.wind);
+        /* 今日温区 + 风向风力 */
+        if (g_weather.high[0] && g_weather.low[0])
+            snprintf(buf, sizeof(buf), "今日 %s~%s °C  %s%s",
+                     g_weather.low, g_weather.high, g_weather.wind_dir, g_weather.wind_level);
+        else
+            snprintf(buf, sizeof(buf), "%s%s", g_weather.wind_dir, g_weather.wind_level);
         lv_label_set_text(g_wx_extra, buf);
+        /* 湿度 + 空气质量 */
+        if (g_weather.pm25 >= 0)
+            snprintf(buf, sizeof(buf), "湿度 %d%%  空气%s  PM2.5 %d",
+                     g_weather.humidity, g_weather.air_quality, g_weather.pm25);
+        else
+            snprintf(buf, sizeof(buf), "湿度 %d%%  空气%s",
+                     g_weather.humidity, g_weather.air_quality);
+        lv_label_set_text(g_wx_air, buf);
         int ago_s = (int)((esp_timer_get_time() / 1000 - g_weather.updated_ms) / 1000);
         if (ago_s < 0) ago_s = 0;
         snprintf(buf, sizeof(buf), "%d 秒前更新", ago_s);
         lv_label_set_text(g_wx_updated, buf);
     } else if (g_weather.error) {
-        lv_label_set_text(g_wx_desc, "获取失败");
+        lv_label_set_text(g_wx_temp, "获取失败");
         lv_label_set_text(g_wx_updated, "请检查网络");
     }
 }
@@ -3994,6 +4832,7 @@ static const char *app_id_name(int id)
     case APP_FILES:    return "文件";
     case APP_SYSINFO:  return "系统";
     case APP_TIMER:    return "计时器";
+    case APP_AI_CHAT:  return "AI聊天";
     default:           return "?";
     }
 }
@@ -4146,6 +4985,14 @@ static void ui_handle_pending_app(void)
     case APP_TIMER:
         if (!g_timer_screen) { g_timer_screen = make_app_screen("计时器"); build_timer_screen(g_timer_screen); }
         scr = g_timer_screen;
+        break;
+    case APP_AI_CHAT:
+        if (!g_ai_screen) {
+            g_ai_screen = make_app_screen("AI聊天");
+            build_ai_chat_screen(g_ai_screen);
+        }
+        s_ai_shown_ver = g_ai.version;   /* 进屏时对齐，避免补一屏旧回复 */
+        scr = g_ai_screen;
         break;
     default:
         break;
@@ -4381,6 +5228,8 @@ static void lvgl_task(void *arg)
         ui_alarm_refresh();           /* 闹钟弹窗可能覆盖任意屏，不按活动屏门控 */
         ui_status_clocks_refresh();   /* 状态栏时钟（恢复） */
         ui_weather_screen_refresh();  /* 内部已按活动屏保护 */
+        ui_ai_screen_refresh();       /* 内部已按活动屏保护，version 变化才重绘 */
+        ui_voice_refresh();           /* 语音：录完触发 ASR，识别结果填入输入框 */
         ui_pcmon_screen_refresh();    /* 内部已按活动屏保护 */
         file_mgr_periodic();          /* 文件命令队列，可能屏外触发，不门控 */
 

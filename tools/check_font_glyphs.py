@@ -13,6 +13,11 @@ DEFAULT_RANGES = [
     (0x20, 0x7E),      # ASCII
     (0xB0, 0xB0),      # °
     (0xB7, 0xB7),      # ·
+    (0xD7, 0xD7),      # × 乘号
+    (0x2010, 0x2027),  # 通用标点 … — 弯引号
+    (0x2030, 0x203B),  # ‰ ※
+    (0x2150, 0x218F),  # 罗马数字 Ⅰ Ⅱ Ⅲ …
+    (0x2190, 0x21FF),  # 箭头 → ←
     (0x3000, 0x303F),  # CJK 标点
     (0xFF01, 0xFF5E),  # 全角
     (0x4E00, 0x9FA5),  # CJK 基本汉字
@@ -27,6 +32,9 @@ def main():
     ranges = DEFAULT_RANGES
     hits = {}
     for path in sorted(glob.glob('main/*.c')):
+        # 字库文件自身含有 /* U+xxxx "字" */ 的注释会被误判为漏字，跳过
+        if path.endswith('lv_font_cn_16.c'):
+            continue
         with open(path, encoding='utf-8') as f:
             lines = f.read().split('\n')
         for lineno, line in enumerate(lines, 1):
