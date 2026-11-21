@@ -287,9 +287,13 @@ static void fm_update_ui(void)
     /* 列表行：原地更新固定行池，不反复建对象 */
     for (int i = 0; i < FILE_MGR_MAX_ROWS; i++) {
         if (i < s_cnt) {
-            char disp[FM_NAME_LEN + 8];
-            elide_name(s_entries[i].name, disp, sizeof(disp), s_name_w);
-            lv_label_set_text(s_row_name[i], disp);
+            /* 完整名字交给 label：超长的由 SCROLL_CIRCULAR 模式自动循环滚动，
+             * 短名字宽度够不会滚。不再手动 elide 截断。
+             * 仅当文本变化时才 set_text，避免重复刷新重置滚动动画回到开头。 */
+            const char *cur = lv_label_get_text(s_row_name[i]);
+            if (!cur || strcmp(cur, s_entries[i].name) != 0) {
+                lv_label_set_text(s_row_name[i], s_entries[i].name);
+            }
             if (s_entries[i].is_dir) {
                 lv_label_set_text(s_row_size[i], "文件夹");
                 lv_obj_set_style_text_color(s_row_name[i], lv_color_hex(0xFFC46B), 0);
@@ -645,13 +649,14 @@ void build_file_manager_screen(lv_obj_t *scr)
         lv_obj_set_style_pad_hor(row, 10, 0);
         lv_obj_set_style_pad_column(row, 8, 0);
 
-        /* 文件名：宽度固定 => 超长自动变省略号，绝不会换成两行 */
+        /* 文件名：宽度固定 + 循环滚动。超长名字自动循环滚动显示完整内容，
+         * 短名字宽度够则不滚。绝不会换成两行。 */
         lv_obj_t *nm = lv_label_create(row);
         lv_label_set_text(nm, "");
         lv_obj_set_style_text_font(nm, &lv_font_cn_16, 0);
         lv_obj_set_style_text_color(nm, lv_color_white(), 0);
         lv_obj_set_width(nm, s_name_w);
-        lv_label_set_long_mode(nm, LV_LABEL_LONG_DOT);
+        lv_label_set_long_mode(nm, LV_LABEL_LONG_MODE_SCROLL_CIRCULAR);
         lv_obj_clear_flag(nm, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_clear_flag(nm, LV_OBJ_FLAG_CLICKABLE);
 

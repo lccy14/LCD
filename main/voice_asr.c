@@ -26,7 +26,7 @@ static SemaphoreHandle_t s_sem = NULL;
 static char   s_path[160];          /* 待识别的 WAV 路径 */
 static char  *s_body = NULL;        /* multipart 请求体，PSRAM */
 static char  *s_resp = NULL;        /* 响应体，PSRAM */
-#define BODY_CAP (600 * 1024)       /* WAV 上限约 300s*32KB/s=9.6MB，这里限制 600KB≈18s 语音 */
+#define MAX_WAV_BYTES (600 * 1024)  /* WAV 上限≈18s；body 按实际 WAV 大小按需分配，用完释放，不再常驻 600KB */
 #define RESP_CAP (4 * 1024)
 
 static void asr_task(void *arg);
@@ -42,9 +42,9 @@ static void set_hint(const char *s)
 
 void voice_asr_init(void)
 {
-    s_body = heap_caps_malloc(BODY_CAP, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    /* s_body 不在 init 分配：600KB 常驻会吃光 2MB PSRAM。改为识别时按实际 WAV 大小分配。 */
     s_resp = heap_caps_malloc(RESP_CAP, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!s_body || !s_resp) {
+    if (!s_resp) {
         ESP_LOGE(TAG, "PSRAM alloc failed, ASR disabled");
         return;
     }
@@ -98,6 +98,26 @@ static int build_multipart(const char *path, const char *key)
     fseek(f, 0, SEEK_END);
     long wav_len = ftell(f);
     fseek(f, 0, SEEK_SET);
+    if (wav_len <= 0 || wav_len > MAX_WAV_BYTES) {
+        ESP_LOGE(TAG, "WAV too large or empty (%ld bytes, limit %d)", wav_len, MAX_WAV_BYTES);
+        set_hint(wav_len > MAX_WAV_BYTES ? "录音太长，请重录(≤18秒)" : "录音文件为空");
+        fclose(f);
+        return -1;
+    }
+
+    /* 按实际大小分配 multipart buffer：head(~400B) + wav + tail(~40B) + 余量。
+     * 不再常驻 600KB——2MB PSRAM 下那是致命浪费。用完由调用方释放。 */
+    size_t need = (size_t)wav_len + 1024;
+    if (s_body) heap_caps_free(s_body);   /* 防御：上一轮异常残留 */
+    s_body = heap_caps_malloc(need, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_body) {
+        ESP_LOGE(TAG, "alloc multipart %u bytes failed (PSRAM free %u)",
+                 (unsigned)need, (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+        set_hint("内存不足，无法识别");
+        fclose(f);
+        return -1;
+    }
+    size_t body_cap = need;
 
     /* 头 + WAV + 尾，留足余量 */
     const char *head_fmt =
@@ -112,19 +132,24 @@ static int build_multipart(const char *path, const char *key)
         "Content-Type: audio/wav\r\n\r\n";
     const char *tail_fmt = "\r\n--%s--\r\n";
 
-    int n = snprintf(s_body, BODY_CAP, head_fmt, ASR_BOUNDARY, ASR_MODEL,
+    int n = snprintf(s_body, body_cap, head_fmt, ASR_BOUNDARY, ASR_MODEL,
                      ASR_BOUNDARY, ASR_BOUNDARY);
-    if (n < 0 || n + wav_len + 128 >= BODY_CAP) {
-        ESP_LOGE(TAG, "WAV too large (%ld bytes, limit ~18s)", wav_len);
+    if (n < 0 || n + wav_len + 128 >= (long)body_cap) {
+        ESP_LOGE(TAG, "multipart buffer too small (%u bytes for wav %ld)", (unsigned)body_cap, wav_len);
         set_hint("录音太长，请重录(≤18秒)");
         fclose(f);
+        heap_caps_free(s_body); s_body = NULL;
         return -1;
     }
     size_t got = fread(s_body + n, 1, (size_t)wav_len, f);
     fclose(f);
-    if (got != (size_t)wav_len) { ESP_LOGE(TAG, "read wav short"); return -1; }
+    if (got != (size_t)wav_len) {
+        ESP_LOGE(TAG, "read wav short");
+        heap_caps_free(s_body); s_body = NULL;
+        return -1;
+    }
     n += (int)got;
-    n += snprintf(s_body + n, BODY_CAP - n, tail_fmt, ASR_BOUNDARY);
+    n += snprintf(s_body + n, body_cap - n, tail_fmt, ASR_BOUNDARY);
     (void)key;   /* Key 在 HTTP header 里用 */
     ESP_LOGI(TAG, "multipart %d bytes (wav %ld)", n, wav_len);
     return n;
@@ -220,6 +245,8 @@ static void asr_task(void *arg)
             }
             esp_http_client_cleanup(c);
         }
+        /* 识别结束（成功/失败）立即释放 multipart buffer，避免常驻吃光 PSRAM */
+        if (s_body) { heap_caps_free(s_body); s_body = NULL; }
         if (!ok) g_asr.error = true;
         g_asr.busy = false;
         publish();

@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <dirent.h>
 
 #include "board.h"
 #include "audio_player.h"     /* 录音开始前停播放，避免回授与 SD/CPU 争抢 */
@@ -164,15 +165,28 @@ static bool wav_write_header(FILE *f, uint32_t data_bytes)
     return fwrite(h, 1, sizeof(h), f) == sizeof(h);
 }
 
-/* 找第一个不存在的 REC_xxxx.wav，避免覆盖之前录的音 */
+/* 找最大编号 +1 作为新录音文件名。
+ * 绝不能「找第一个不存在的编号」——旧文件被清理后小编号会空出来被复用，
+ * 而 sd_prune_files 按编号保留最大的 N 个，刚录的小编号文件会被当最旧的删掉，
+ * 导致录完立刻消失、ASR 打不开文件。编号只增不复用就没这个问题。 */
 static bool make_rec_path(char *out, size_t n)
 {
-    struct stat st;
-    for (int i = 1; i <= 9999; i++) {
-        snprintf(out, n, "%s/REC_%04d.wav", SD_MOUNT_POINT, i);
-        if (stat(out, &st) != 0) return true;
+    DIR *d = opendir(SD_MOUNT_POINT);
+    if (!d) return false;
+    int max_id = 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        const char *nm = e->d_name;
+        if (strncmp(nm, "REC_", 4) != 0) continue;
+        size_t len = strlen(nm);
+        if (len < 12 || strcmp(nm + len - 4, ".wav") != 0) continue;
+        int id = atoi(nm + 4);   /* "REC_0001.wav" → 0001 */
+        if (id > max_id) max_id = id;
     }
-    return false;
+    closedir(d);
+    if (max_id >= 9999) return false;
+    snprintf(out, n, "%s/REC_%04d.wav", SD_MOUNT_POINT, max_id + 1);
+    return true;
 }
 
 /* 32bit×2slot 原始帧 → 16bit 单声道 PCM。
@@ -302,6 +316,8 @@ static void record_session(void)
         set_hint("录音已保存"); publish();
         ESP_LOGI(TAG, "record done: %s (%u bytes, %u ms)",
                  path, (unsigned)data_bytes, (unsigned)g_mic.elapsed_ms);
+        /* 只保留最近 20 个录音，旧的自动删除，防止 SD 卡被填满 */
+        sd_prune_files("REC_", ".wav", 20);
     }
     g_mic.recording = false;
     g_mic.done      = true;

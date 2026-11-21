@@ -62,21 +62,29 @@ static char *s_res_buf = NULL;   /* 响应 JSON，PSRAM */
 
 /* 最近一轮上下文（PSRAM 缓冲，跟随请求一起发），提升多轮连贯性 */
 static char s_last_q[512];
-static char s_last_a[2048];   /* 与 parse_content 输出等大，避免语义被腰斩 */
+static char s_last_a[512];    /* 与 parse_content 输出/reply 等大，全链路统一 512 */
 
 /* UTF-8 安全拷贝：截断时回退到完整字符边界，避免把 3 字节汉字/4 字节 emoji
  * 截成非法序列——那会导致下一轮请求带坏 UTF-8 被 API 以 400 拒绝。 */
-static void utf8_strncpy(char *dst, const char *src, size_t cap)
+static void utf8_strncpy(volatile char *dst, const volatile char *src, size_t cap)
 {
     if (cap == 0) return;
     size_t n = 0;
-    while (src[n] && n < cap - 1) n++;
+    while (src[n] && n < cap - 1) { dst[n] = src[n]; n++; }  /* 逐字节拷贝（volatile 不能 memcpy） */
     dst[n] = '\0';
+    /* 回退到完整字符边界：从末尾往前找最后一个起始字节(非 10xxxxxx)，
+     * 若从它到末尾的字节数 >= 它要求的长度，则该字符完整、保留；
+     * 否则这个字符被截断了，把起始字节也删掉，继续往前找。 */
     while (n > 0) {
-        unsigned char c = (unsigned char)dst[n - 1];
-        if ((c & 0xC0) != 0x80) break;   /* 找到起始字节，说明截断在字符边界 */
-        dst[--n] = '\0';                 /* 否则是续字节，丢掉整个不完整字符 */
+        size_t start = n - 1;
+        /* 往前跳过连续的续字节，找到当前字符的起始字节 */
+        while (start > 0 && ((unsigned char)dst[start] & 0xC0) == 0x80) start--;
+        unsigned char lead = (unsigned char)dst[start];
+        size_t need = (lead < 0x80) ? 1 : (lead < 0xE0) ? 2 : (lead < 0xF0) ? 3 : 4;
+        if (n - start >= need) break;    /* 末尾字符完整，到此为止 */
+        n = start;                       /* 末尾字符不完整，删掉整个字符 */
     }
+    dst[n] = '\0';
 }
 
 /* ---------------- NVS: 平台与 Key ---------------- */
@@ -211,7 +219,9 @@ static bool parse_content(const char *json, char *out, size_t cap)
 
     size_t n = 0;
     while (*p && n + 1 < cap) {
-        if (*p == '"') { n++; break; }
+        /* 结束引号：直接跳出，绝不 n++ —— 之前 n++ 会在字符串末尾留下一个
+         * 未写入的栈垃圾字节(如 0xa5)，下一轮当上下文发出去被 API 以 400 拒绝。 */
+        if (*p == '"') break;
         if (*p == '\\') {
             p++;
             switch (*p) {
@@ -228,14 +238,17 @@ static bool parse_content(const char *json, char *out, size_t cap)
                         unsigned cp = 0;
                         sscanf(p + 1, "%4x", &cp);
                         if (cp >= 0x20 && cp < 0x10000 && cp < 0xD800) {
-                            if (cp < 0x80) out[n++] = (char)cp;
-                            else if (cp < 0x800) {
-                                out[n++] = (char)(0xC0 | (cp >> 6));
-                                out[n++] = (char)(0x80 | (cp & 0x3F));
-                            } else {
-                                out[n++] = (char)(0xE0 | (cp >> 12));
-                                out[n++] = (char)(0x80 | ((cp >> 6) & 0x3F));
-                                out[n++] = (char)(0x80 | (cp & 0x3F));
+                            size_t need = (cp < 0x80) ? 1 : (cp < 0x800) ? 2 : 3;
+                            if (n + need < cap) {   /* 留 1 字节给结尾 '\0' */
+                                if (cp < 0x80) out[n++] = (char)cp;
+                                else if (cp < 0x800) {
+                                    out[n++] = (char)(0xC0 | (cp >> 6));
+                                    out[n++] = (char)(0x80 | (cp & 0x3F));
+                                } else {
+                                    out[n++] = (char)(0xE0 | (cp >> 12));
+                                    out[n++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                                    out[n++] = (char)(0x80 | (cp & 0x3F));
+                                }
                             }
                         }
                         p += 4;
@@ -318,9 +331,9 @@ done:
 
 static void set_reply(const char *s)
 {
-    size_t i = 0;
-    for (; i + 1 < sizeof(g_ai.reply) && s[i]; i++) g_ai.reply[i] = s[i];
-    g_ai.reply[i] = '\0';
+    /* 用 UTF-8 安全拷贝：reply 只有 512B，长回复截断时若停在半个汉字中间，
+     * 会产生非法 UTF-8（下一轮当上下文发出去会被 API 以 400 拒绝）。 */
+    utf8_strncpy(g_ai.reply, s, sizeof(g_ai.reply));
 }
 
 static void ai_task(void *arg)
@@ -380,7 +393,7 @@ static void ai_task(void *arg)
             e = ai_http_post(prov, s_req_buf, s_res_buf, RES_CAP);
         }
         if (e == ESP_OK) {
-            char ans[2048];
+            char ans[512];
             if (parse_content(s_res_buf, ans, sizeof(ans))) {
                 set_reply(ans);
                 utf8_strncpy(s_last_q, question, sizeof(s_last_q));

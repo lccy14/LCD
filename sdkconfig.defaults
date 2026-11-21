@@ -69,10 +69,24 @@ CONFIG_LV_IME_PINYIN_USE_DEFAULT_DICT=y
 CONFIG_LV_IME_PINYIN_CAND_TEXT_NUM=9
 
 # TLS 接收缓冲：4096 太小，智谱等 API 的证书链/TLS 记录超限会报
-# -0x87 BAD_INPUT_DATA (PSA_ERROR_INVALID_ARGUMENT)。提到 8192 覆盖大多数站点。
+# -0x87 BAD_INPUT_DATA (PSA_ERROR_INVALID_ARGUMENT)。提到 16384 覆盖大数据响应
+# （TTS 下载音频时 TLS 记录较大，8192 仍偶发截断）。
 CONFIG_MBEDTLS_ASYMMETRIC_CONTENT_LEN=y
-CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=8192
+CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=16384
 CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=4096
+
+# 交叉签名证书验证：百度(aip.baidubce.com / tsn.baidu.com)等国内 CDN 用
+# cross-signed 证书链，默认 bundle 验签会报 "No matching trusted root certificate found"。
+# 开启后仍完整校验链，只是支持交叉签名根，不影响安全性。
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_CROSS_SIGNED_VERIFY=y
+
+# TLS 动态缓冲会让 esp_http_client 每次读出的数据块大小不定(731/264/3537)，
+# 配合小 buffer 时大 record 解密触发 -0x0087 (PSA_ERROR_INVALID_ARGUMENT)，
+# TTS 下载 MP3 读到几 KB 就断。改用固定大缓冲。
+CONFIG_MBEDTLS_SSL_VARIABLE_BUFFER_LENGTH=n
+# esp_http_client 的接收 buffer(16KB)必须是内部 RAM：
+# 低于此值的 malloc 走内部 DRAM，避免 TLS 解密目标落在 PSRAM。
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=32768
 
 # ECDHE 握手的 psa_generate_key 需要内部 RAM。只保留 TLS 实际会用的两种曲线
 # (X25519 / SECP256R1)，关掉 521/K1/Brainpool 省下大量定点预计算表占用的 RAM，

@@ -11,9 +11,10 @@
  *      （这些操作会阻塞，不能放进 LVGL 输入事件回调里做，否则卡看门狗）
  */
 
-/* 单屏最多显示的条目数：受 LVGL 对象数量限制（每行 3 个对象），
- * 超过 FM_MAX_ROWS 的目录只显示前 FM_MAX_ROWS 项，状态栏会提示。 */
-#define FILE_MGR_MAX_ROWS 32
+/* 单屏最多显示的条目数：受 LVGL 对象数量限制（每行 3 个对象）。
+ * 32 太小——录音/TTS 文件加上其他文件很容易超过，导致后面的文件看不到。
+ * 提到 96（288 个 LVGL 对象，PSRAM 池 1MB 足够）；超出的目录状态栏仍会提示。 */
+#define FILE_MGR_MAX_ROWS 96
 
 /* 构建界面（只调用一次，屏幕对象由 ui.c 的 make_app_screen 创建） */
 void build_file_manager_screen(lv_obj_t *scr);

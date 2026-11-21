@@ -91,7 +91,10 @@
 #define AUDIO_I2S_BCLK_GPIO    GPIO_NUM_6   /* IO6  → BCLK */
 #define AUDIO_I2S_LRCK_GPIO    GPIO_NUM_7   /* IO7  → LRCLK */
 #define AUDIO_I2S_DOUT_GPIO    GPIO_NUM_5   /* IO5  → 功放 DIN */
-#define AUDIO_I2S_SD_MODE_GPIO GPIO_NUM_4   /* IO4  → SD_MODE */
+/* 第二版硬件：MAX98357A 的 SD_MODE 经 10K 上拉到 VDD。
+ * 由软件控制：播放时拉高(功放工作)，暂停/停止时拉低(关断、消除底噪滋滋声)。
+ * GPIO 推挽输出的低阻抗远小于 10K，写 0 能可靠拉低关断。 */
+#define AUDIO_I2S_SD_MODE_GPIO GPIO_NUM_4   /* IO4  → SD_MODE（软件控制，拉高=工作） */
 
 /* ---------- 触摸：FT6336（I2C） ----------
  * 原理图左侧引脚 8~11：TP_RES / TP_INT / TP_CLK / TP_SDA。

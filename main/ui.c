@@ -30,6 +30,7 @@
 #include "mic_rec.h"          /* I2S1 RX 麦克风录音 → WAV */
 #include "ai_chat.h"          /* AI 聊天：国内 HTTPS API（可切平台）→ 回复 */
 #include "voice_asr.h"        /* 语音输入：录音 WAV → 智谱 ASR → 文字 */
+#include "voice_tts.h"        /* 语音输出：AI 回复 → 智谱 TTS → WAV 播放 */
 #include "src/widgets/ime/lv_ime_pinyin.h"  /* 拼音输入法：键盘打中文 */
 #include "lv_pinyin_dict_cn.h" /* 简体拼音字典（2 万字，覆盖内置字典缺的字） */
 #include <dirent.h>           /* 音乐：扫描 SD 卡音频文件（opendir/readdir） */
@@ -259,6 +260,7 @@ static lv_obj_t *g_ai_voice_btn = NULL;   /* 语音输入按钮（点开始/停�
 static lv_obj_t *g_ai_voice_lbl = NULL;   /* 语音按钮文字（录音/识别状态） */
 static uint32_t  s_ai_shown_ver = 0;
 static uint32_t  s_asr_shown_ver = 0;
+static bool      g_tts_auto = false;   /* AI 回复自动播报开关（设置页控制，默认关） */
 
 /* 电脑监控屏：传感器行标签池（最多 PC_MON_MAX_SENSORS 行，懒加载创建一次） */
 static lv_obj_t *g_pcmon_screen = NULL;
@@ -881,6 +883,13 @@ static void volume_cb(lv_event_t *e)
     if (g_vol_label) lv_label_set_text_fmt(g_vol_label, "%d%%", v);
 }
 
+/* AI 回复自动播报开关 */
+static void tts_auto_cb(lv_event_t *e)
+{
+    lv_obj_t *sw = lv_event_get_target(e);
+    g_tts_auto = lv_obj_has_state(sw, LV_STATE_CHECKED);
+}
+
 /* 设置列表里的一条手机风格分隔线（左右各留 14px 缩进） */
 static void settings_add_separator(lv_obj_t *parent)
 {
@@ -1015,6 +1024,33 @@ static void build_settings_screen(lv_obj_t *scr)
     lv_slider_set_value(vsl, (int)g_audio.volume, LV_ANIM_OFF);
     lv_obj_set_scrollbar_mode(vsl, LV_SCROLLBAR_MODE_OFF);
     lv_obj_add_event_cb(vsl, volume_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    settings_add_separator(list);
+
+    /* ---------- AI 回复自动播报 ---------- */
+    lv_obj_t *ttsrow = lv_obj_create(list);
+    lv_obj_set_width(ttsrow, LV_PCT(100));
+    lv_obj_set_height(ttsrow, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(ttsrow, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_opa(ttsrow, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_radius(ttsrow, 0, 0);
+    lv_obj_set_style_pad_hor(ttsrow, 14, 0);
+    lv_obj_set_style_pad_top(ttsrow, 14, 0);
+    lv_obj_set_style_pad_bottom(ttsrow, 14, 0);
+    lv_obj_set_flex_flow(ttsrow, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(ttsrow, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(ttsrow, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(ttsrow, LV_SCROLLBAR_MODE_OFF);
+
+    lv_obj_t *ttsl = lv_label_create(ttsrow);
+    lv_label_set_text(ttsl, "AI回复自动播报");
+    lv_obj_set_style_text_font(ttsl, &lv_font_cn_16, 0);
+    lv_obj_set_style_text_color(ttsl, lv_color_white(), 0);
+    lv_obj_clear_flag(ttsl, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t *ttssw = lv_switch_create(ttsrow);
+    /* 默认关：不 add_state；开关状态由 g_tts_auto 控制 */
+    lv_obj_add_event_cb(ttssw, tts_auto_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
     settings_add_separator(list);
 
@@ -2558,6 +2594,20 @@ static void ai_copy_volatile(const volatile char *src, char *dst, size_t cap)
     dst[n] = '\0';
 }
 
+/* 聊天历史最多保留 5 轮问答 = 10 个气泡（每轮用户+AI 各一）。
+ * 超出时删最老的，避免长时间聊天累积 LVGL 对象耗尽内存池。 */
+#define AI_MAX_BUBBLES 10
+
+/* 点击 AI 气泡朗读这条回复（手动播报）。从 label 取当前文字，
+ * 传 lv_label_get_text 返回的普通 const char* 给 tts（内部拷到 PSRAM）。 */
+static void ai_bubble_speak_cb(lv_event_t *e)
+{
+    lv_obj_t *lab = lv_event_get_user_data(e);
+    if (!lab) return;
+    const char *txt = lv_label_get_text(lab);
+    if (txt && txt[0] && !g_tts.busy) voice_tts_speak(txt);
+}
+
 /* 微信式气泡：is_user=true 靠右绿色，false 靠左深灰。返回气泡对象供复用。
  * text 是 volatile，先拷到局部。每行一个行容器 + 一个气泡 + 一个 label，
  * 消息列表用 flex column 自动往下排，不再重叠。 */
@@ -2566,6 +2616,20 @@ static lv_obj_t *ai_add_bubble(const volatile char *text, bool is_user, lv_color
     if (!g_ai_chat_box) return NULL;
     char buf[512];
     ai_copy_volatile(text, buf, sizeof(buf));
+
+    /* 超出上限删最老的气泡（child[0] 是最早那轮）。思考中气泡总是最新创建的，
+     * 不会被删到；但仍校验句柄，万一被删就置空，避免刷新回调操作失效对象。 */
+    while (lv_obj_get_child_count(g_ai_chat_box) >= AI_MAX_BUBBLES) {
+        lv_obj_t *oldest = lv_obj_get_child(g_ai_chat_box, 0);
+        if (!oldest) break;
+        /* 若思考中气泡在待删子树内，先清句柄（正常不会发生，它总是最新创建的） */
+        if (g_ai_thinking_bubble) {
+            lv_obj_t *p = g_ai_thinking_bubble;
+            while (p && p != g_ai_chat_box && p != oldest) p = lv_obj_get_parent(p);
+            if (p == oldest) g_ai_thinking_bubble = NULL;
+        }
+        lv_obj_delete(oldest);
+    }
 
     /* 行容器：整行宽、高自适应，透明无边框 */
     lv_obj_t *row = lv_obj_create(g_ai_chat_box);
@@ -2598,6 +2662,12 @@ static lv_obj_t *ai_add_bubble(const volatile char *text, bool is_user, lv_color
     lv_obj_set_style_text_font(lab, &lv_font_cn_16, 0);
     lv_obj_set_style_text_color(lab, text_color, 0);
     lv_label_set_text(lab, buf);
+
+    /* AI 气泡可点朗读：点一下把这条回复读出来（自动播报关时的手动入口） */
+    if (!is_user) {
+        lv_obj_add_flag(bub, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(bub, ai_bubble_speak_cb, LV_EVENT_CLICKED, lab);
+    }
 
     lv_obj_scroll_to_y(g_ai_chat_box, LV_COORD_MAX, LV_ANIM_OFF);
     return lab;   /* 返回 label 便于更新「思考中」 */
@@ -2984,6 +3054,12 @@ static void ui_ai_screen_refresh(void)
         /* 没有待更新气泡（如进屏对齐后收到新消息），新建一条 AI 气泡 */
         ai_add_bubble(buf, false, g_ai.error ? lv_color_hex(0xFF8B85) : lv_color_white());
     }
+    /* 自动播报：只在请求已结束(busy=false)且非错误时朗读真实回复。
+     * AI 请求有两次 version++：①"思考中"(busy=true) ②真实回复(busy=false)。
+     * 若不加 !g_ai.busy，会先念"思考中"，等真实回复到达时 TTS 还忙而被跳过，
+     * 结果只能听到"思考中"。 */
+    if (g_tts_auto && !g_ai.error && !g_ai.busy && buf[0] && !g_tts.busy)
+        voice_tts_speak(buf);
 }
 
 /* API Key 设置浮层：全局挂在 lv_layer_top()，任何屏都能打开。

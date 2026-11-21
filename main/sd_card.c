@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/statvfs.h>
+#include <dirent.h>
 
 #include "esp_log.h"
 #include "esp_heap_caps.h"
@@ -221,4 +222,64 @@ bool sd_card_get_space(uint64_t *total, uint64_t *free_bytes)
     if (total)      *total      = unit * (uint64_t)st.f_blocks;
     if (free_bytes) *free_bytes = unit * (uint64_t)st.f_bfree;
     return true;
+}
+
+/* 清理形如 prefixNNNN.ext 的旧文件，只保留编号最大的 keep 个。
+ * 文件名编号递增（REC_0001.wav / TTS_0001.mp3），编号越大越新。 */
+int sd_prune_files(const char *prefix, const char *ext, int keep)
+{
+    if (!g_sdcard.mounted || !prefix || !ext || keep < 0) return 0;
+
+    DIR *d = opendir(SD_MOUNT_POINT);
+    if (!d) { ESP_LOGW(TAG, "prune: opendir failed"); return 0; }
+
+    /* 收集匹配文件：编号 + 完整路径。上限 512 个，够日常使用 */
+    typedef struct { int id; char name[64]; } file_entry_t;
+    file_entry_t files[512];
+    int count = 0;
+    size_t plen = strlen(prefix), elen = strlen(ext);
+
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL && count < 512) {
+        const char *nm = e->d_name;
+        size_t nl = strlen(nm);
+        if (nl <= plen + elen) continue;                       /* 太短，跳过 */
+        if (strncmp(nm, prefix, plen) != 0) continue;           /* 前缀不符 */
+        if (strcmp(nm + nl - elen, ext) != 0) continue;         /* 扩展名不符 */
+        /* 中间必须是纯数字编号 */
+        const char *num = nm + plen;
+        size_t nlen = nl - plen - elen;
+        int id = 0;
+        bool digits = true;
+        for (size_t i = 0; i < nlen; i++) {
+            if (num[i] < '0' || num[i] > '9') { digits = false; break; }
+            id = id * 10 + (num[i] - '0');
+        }
+        if (!digits || nlen == 0) continue;
+        files[count].id = id;
+        /* 只取解析出的 prefix+数字+ext 部分，不拷整个 d_name，避免截断警告 */
+        snprintf(files[count].name, sizeof(files[count].name), "%s/%.*s",
+                 SD_MOUNT_POINT, (int)nl, nm);
+        count++;
+    }
+    closedir(d);
+
+    if (count <= keep) return 0;   /* 未超限，不删 */
+
+    /* 冒泡排序：编号小的（旧的）在前 */
+    for (int i = 0; i < count - 1; i++) {
+        for (int j = 0; j < count - 1 - i; j++) {
+            if (files[j].id > files[j + 1].id) {
+                file_entry_t t = files[j]; files[j] = files[j + 1]; files[j + 1] = t;
+            }
+        }
+    }
+
+    int removed = 0;
+    for (int i = 0; i < count - keep; i++) {
+        if (remove(files[i].name) == 0) removed++;
+        else ESP_LOGW(TAG, "prune: remove %s failed", files[i].name);
+    }
+    if (removed) ESP_LOGI(TAG, "pruned %d old files (%s*%s), kept %d", removed, prefix, ext, keep);
+    return removed;
 }

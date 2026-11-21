@@ -43,7 +43,7 @@ static bool               s_tx_enabled = false;
 static void amp_enable(bool on)
 {
     gpio_num_t pin = AUDIO_I2S_SD_MODE_GPIO;
-    if (pin < 0) return;                 /* 宏设为 GPIO_NUM_NC：硬件已上拉，跳过 */
+    if (pin < 0) return;                 /* GPIO_NUM_NC：硬件已上拉，功放常开，软件不控制 */
     gpio_set_level(pin, on ? 1 : 0);
 }
 

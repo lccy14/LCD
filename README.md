@@ -89,7 +89,7 @@ idf.py flash monitor
 
 ### 音乐播放器
 硬件：ESP32-S3 I2S → **MAX98357AETE+T**（Class D 功放，3 线 BCLK/LRCK/DIN，无需 MCLK、无需 I2C 配置）。
-引脚在 `main/board.h` 的 `AUDIO_I2S_*` 宏集中定义，按**第二版 PCB** 接线：`BCLK=6 / LRCK=7 / DOUT→DIN=5 / SD_MODE=4`。
+引脚在 `main/board.h` 的 `AUDIO_I2S_*` 宏集中定义，按**第二版 PCB** 接线：`BCLK=6 / LRCK=7 / DOUT→DIN=5 / SD_MODE=4`。SD_MODE 由软件控制：播放时拉高（功放工作），暂停/停止时拉低（关断、消除底噪滋滋声）。硬件侧该脚另有 10K 上拉到 VDD，GPIO 输出的低阻抗足以在需要时拉低。
 ⚠️ `board.h` 顶部有 `BOARD_REV` 开关（默认 `2` = 第二版）。第二版把 LCD/触摸/SD 引脚也全部重排了，与第一版不兼容；手上仍是第一版板子时改成 `1` 再烧录，否则屏幕不亮、SD 挂不上。完整引脚表见 `wiring_diagram.txt`。
 
 界面：黑胶唱片封面 + 曲名 + 进度条（含当前/总时长）+ 音量条 + 四个按钮（上一首 / 播放·暂停 / 下一首 / 录音）。
@@ -99,7 +99,7 @@ idf.py flash monitor
   - 时长：有 Xing/VBRI 帧数时精确，纯 CBR 文件按首帧码率估算（可能偏差几秒）。
   - **seek 是近似的**：MP3 没有帧索引，按字节比例定位后重新找帧同步，VBR 文件偏差更明显。
 - **上一首 / 下一首**：在 SD 卡音频列表（WAV + MP3）间切换（到末尾停止）。文件管理器里点音频文件也能直接跳转播放。
-- **播放·暂停**：真正暂停/恢复 I2S 输出，并关断/开启功放 SD_MODE（暂停无底噪）。
+- **播放·暂停**：真正暂停/恢复 I2S 输出，并关断/开启功放 SD_MODE（暂停时无底噪滋滋声）。
 - **拖动进度条**：seek；**音量条**：PCM 软件缩放 0~100%。
 
 ### 录音（麦克风）
@@ -108,8 +108,8 @@ idf.py flash monitor
 
 - 用独立 **`I2S_NUM_1`** 控制器，与功放的 `I2S_NUM_0` 完全隔离；主控给 SCK/WS，麦克风无需 MCLK 或 I2C 配置。
 - 音乐屏第四个按钮：**点一下开始、再点停止**。曲名栏实时显示录音时长与电平，进度条临时当电平表。
-- 后台任务把 32bit 立体声原始帧按声道取高 16 位、做 DC 阻断和增益，写成 **16kHz / 16bit / 单声道 WAV**（32KB/s），录完回填 RIFF 头，保存到 `/sdcard/REC_0001.wav`（编号递增、不覆盖旧文件），并自动刷新播放列表，可直接点播。
-- 单次上限 5 分钟；录音时自动停播放并关断功放 `SD_MODE`（防回授啸叫），录音中播放请求会被拒绝。
+- 后台任务把 32bit 立体声原始帧按声道取高 16 位、做 DC 阻断和增益，写成 **16kHz / 16bit / 单声道 WAV**（32KB/s），录完回填 RIFF 头，保存到 `/sdcard/REC_0001.wav`（编号递增、不覆盖旧文件），并自动刷新播放列表，可直接点播。每次录完自动清理：只保留最近 20 个 `REC_xxxx.wav`，更早的删除（`sd_prune_files`），防止 SD 卡被填满。
+- 单次上限 5 分钟；录音时自动停播放（防回授啸叫），录音中播放请求会被拒绝。
 - 全局状态 `g_mic` + `version` 轮询（与播放/天气同构），网络/文件 IO 全在 PSRAM 栈的后台任务里，不碰 LVGL 线程。
 - ⚠️ **第一版 PCB 不能接麦克风**（IO1/IO2 是 SD D2/D3、IO42 是 SD CMD）；`BOARD_REV=1` 时 `MIC_HW_PRESENT=0`，录音按钮自动变灰、功能完全禁用。
 - 排错（全噪声/静音）：`L/R` 接 3V3 时把 `MIC_SLOT_RIGHT` 改成 `1`；声音太轻把 `mic_rec.c` 的 `MIC_GAIN` 从 `2` 调到 `4~8`。详见 `wiring_diagram.txt` 麦克风章节。
@@ -132,7 +132,8 @@ idf.py flash monitor
   | 硅基流动 | `Qwen/Qwen2.5-7B-Instruct` | 9B 以下免费 | siliconflow.cn |
   三家都是 OpenAI 兼容格式、国内直连；切换后输入框自动载入该平台已存的 Key。
 - 点输入框弹出拼音/英文键盘，输入后点「发送」或键盘 Enter；后台异步请求，界面显示「思考中...」，回复返回后自动刷新。支持最近一轮上下文。
-- **语音输入（第一步）**：聊天页顶部绿色「语音」按钮，点一下开始录音、再点「停止」结束；录音经智谱 `glm-asr-2512` 识别（复用当前平台的 Key，multipart 上传 WAV），识别出的文字**自动填入输入框**，你确认/修改后再点发送——识别错了也能改，不会一错到底。单次语音建议 ≤18 秒（ASR 上传缓冲上限）。语音输出（TTS 播报）暂未实现。
+- **语音输入（第一步）**：聊天页顶部绿色「语音」按钮，点一下开始录音、再点「停止」结束；录音经智谱 `glm-asr-2512` 识别（复用当前平台的 Key，multipart 上传 WAV），识别出的文字**自动填入输入框**，你确认/修改后再点发送——识别错了也能改，不会一错到底。单次语音建议 ≤18 秒（ASR 上传缓冲上限）。
+- **语音输出（TTS 播报）**：用**百度语音合成（免费额度，个人认证 5 万次）**把 AI 回复合成 MP3 并播放。先在百度智能云创建语音合成应用，把 API Key / Secret Key 填到 `main/ai_key_local.h` 的 `BAIDU_TTS_API_KEY` / `BAIDU_TTS_SECRET_KEY`（换 Key 需重编译）。流程：oauth 换 access_token（缓存 30 天）→ POST `tsn.baidu.com/text2audio`（`aue=3` 返回 MP3）→ 流式写 SD（`/sdcard/TTS_xxxx.mp3`）→ `audio_player` 播放。用 MP3 而非 WAV：同长度语音数据量约 1/10，避免 ESP32 TLS 接收大响应时偶发 `read error -0x0087` 截断（曾导致只播第一个字）；下载后按 `Content-Length` 校验完整性，不全则删文件重试。单次限 60 汉字，长回复按字符边界自动分段、串行合成播放。两种触发：① 设置页开「AI回复自动播报」后每条回复自动读；② 关闭时**点 AI 气泡**手动读该条。合成在 PSRAM 后台任务。同理只保留最近 20 个 `TTS_xxxx.mp3`，更早的自动删除，防止 SD 卡填满。
 - 拼音输入用 **`main/lv_pinyin_dict_cn.c`** 生成的简体字典（420 个拼音 / 2 万字，替代 LVGL 自带仅 1168 字的繁体字典），常用简体字都可打出；候选栏 `<` `>` 翻页。字典由 `python tools/gen_pinyin_dict.py` 从 pypinyin 数据生成（需 `pip install pypinyin`），自动生成文件勿手改。
 - HTTPS + CA bundle 校验，非流式；网络/JSON 缓冲与任务栈全在 PSRAM。单次连接超时 12 秒、失败自动重试 1 次（对抗偶发丢 SYN）。曾因内部 RAM 耗尽在 RSA 验证时 `abort()`，已将音乐路径表/书单挪到 PSRAM、保留 draw buf 320×40×2 不降画质；请求日志打印 `free_internal` 便于诊断。
 - ⚠️ Key 以明文存 NVS，仅适合个人设备。免费平台也有频率/额度限制，政策以各家官网为准。
@@ -156,6 +157,7 @@ idf.py flash monitor
 ### 设置
 - **亮度**：10%~100% 滑块，LEDC PWM 调 LCD 背光。
 - **喇叭音量**：0%~100% 滑块，`audio_player` 软件数字增益（MAX98357A 无硬件音量控制，靠 I2S 数据缩放）。默认 80%，掉电不保存。
+- **AI回复自动播报**：开关，默认关；开启后每条 AI 回复自动 TTS 播报，关闭时可点 AI 气泡手动播。
 - 其他配置项（WiFi 等）见源码对应模块。
 
 ---
@@ -170,6 +172,7 @@ idf.py flash monitor
 │   ├── mic_rec.c         # 录音引擎：I2S1 麦克风 → 16bit WAV → /sdcard
 │   ├── ai_chat.c/.h      # AI 聊天：多平台 HTTPS POST + NVS 分平台 Key + PSRAM 后台任务
 │   ├── voice_asr.c/.h    # 语音输入：录音 WAV → 智谱 glm-asr-2512 识别 → 文字
+│   ├── voice_tts.c/.h    # 语音输出：AI 回复 → 百度语音合成(免费) → WAV 写 SD → audio_player 播放
 │   ├── lv_pinyin_dict_cn.c/.h  # 简体拼音字典（自动生成，2 万字）
 │   ├── minimp3.h         # MP3 解码器（单头文件，CC0 公共领域，无外部依赖）
 │   ├── minimp3_impl.c    # minimp3 实现编译单元（只在此展开一次）

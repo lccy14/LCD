@@ -8,7 +8,7 @@ typedef struct {
     bool     busy;        /* 正在请求中 */
     bool     error;       /* 上次请求失败 */
     uint32_t version;     /* 每次请求结束 +1，UI 据此刷新 */
-    char     reply[2048]; /* 最新回复，PSRAM 任务写入（结构体本身在内部 RAM 很小） */
+    char     reply[512];  /* 最新回复（约 170 汉字），PSRAM 任务写入；全链路统一 512 */
 } ai_chat_state_t;
 
 extern volatile ai_chat_state_t g_ai;

@@ -40,3 +40,9 @@ bool sd_card_is_mounted(void);
 
 /* 查询 FATFS 空间：total / free 单位为字节，返回 false 表示未挂载 */
 bool sd_card_get_space(uint64_t *total, uint64_t *free_bytes);
+
+/* 清理旧文件，防止 SD 卡被录音/TTS 文件填满。
+ * 扫描 SD_MOUNT_POINT 下形如 "prefixNNNN.ext" 的文件（NNNN 为十进制编号），
+ * 按编号从大到小保留最近 keep 个，删除更早的。返回删除的文件个数。
+ * 例：sd_prune_files("REC_", ".wav", 20) 只留最新 20 个 REC_xxxx.wav。 */
+int sd_prune_files(const char *prefix, const char *ext, int keep);

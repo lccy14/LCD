@@ -4,6 +4,7 @@
 #include "mic_rec.h"
 #include "ai_chat.h"
 #include "voice_asr.h"
+#include "voice_tts.h"
 #include "wifi_scan.h"   /* WiFi 初始化提前到 UI 之前：RAM 最空时连，避开进书把 DMA 吃光导致重试失败 */
 #include "esp_log.h"     /* ESP_LOGE */
 
@@ -36,6 +37,9 @@ void app_main(void)
 
     /* 语音识别后台任务（栈/缓冲在 PSRAM），复用 AI 模块的智谱 Key */
     voice_asr_init();
+
+    /* 语音合成后台任务（栈/缓冲在 PSRAM），复用智谱 Key + audio_player 播放 */
+    voice_tts_init();
 
     ui_app_start();
 }
