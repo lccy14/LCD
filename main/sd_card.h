@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include "esp_err.h"
+#include "sdmmc_cmd.h"
 
 /* SD 卡：ESP32-S3 的 SDMMC 主机（非 SPI）。
  * 引脚集中在 board.h（SDMMC_PIN_*）；换板只改 board.h。
@@ -46,3 +47,10 @@ bool sd_card_get_space(uint64_t *total, uint64_t *free_bytes);
  * 按编号从大到小保留最近 keep 个，删除更早的。返回删除的文件个数。
  * 例：sd_prune_files("REC_", ".wav", 20) 只留最新 20 个 REC_xxxx.wav。 */
 int sd_prune_files(const char *prefix, const char *ext, int keep);
+
+/* USB MSC 用：只初始化 SDMMC 控制器和卡（不挂 FATFS），返回 card 句柄。
+ * 调用前必须先 sd_card_unmount()；用完后必须 sd_card_raw_deinit()。
+ * 复用当前已验证成功的总线宽度/时钟（g_sdcard 记录的实际值）。 */
+void      sd_card_save_params(void);
+esp_err_t sd_card_raw_init(sdmmc_card_t **out_card);
+void      sd_card_raw_deinit(sdmmc_card_t *card);

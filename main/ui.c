@@ -31,6 +31,7 @@
 #include "ai_chat.h"          /* AI 聊天：国内 HTTPS API（可切平台）→ 回复 */
 #include "voice_asr.h"        /* 语音输入：录音 WAV → 智谱 ASR → 文字 */
 #include "voice_tts.h"        /* 语音输出：AI 回复 → 智谱 TTS → WAV 播放 */
+#include "usb_msc.h"          /* USB 模拟U盘：SD 卡通过 USB 暴露给电脑 */
 #include "src/widgets/ime/lv_ime_pinyin.h"  /* 拼音输入法：键盘打中文 */
 #include "lv_pinyin_dict_cn.h" /* 简体拼音字典（2 万字，覆盖内置字典缺的字） */
 #include <dirent.h>           /* 音乐：扫描 SD 卡音频文件（opendir/readdir） */
@@ -261,6 +262,11 @@ static lv_obj_t *g_ai_voice_lbl = NULL;   /* 语音按钮文字（录音/识别�
 static uint32_t  s_ai_shown_ver = 0;
 static uint32_t  s_asr_shown_ver = 0;
 static bool      g_tts_auto = false;   /* AI 回复自动播报开关（设置页控制，默认关） */
+
+/* USB 模拟U盘：开关回调只置 pending，实际 start/stop 在主循环做（阻塞操作不能卡 LVGL 回调） */
+static int       s_usb_msc_pending = 0;   /* 0=无 1=请求开启 -1=请求关闭 */
+static lv_obj_t *g_usb_msc_label = NULL;  /* 设置页里的状态提示 label */
+static lv_obj_t *g_usb_msc_switch = NULL; /* 设置页里的 U 盘开关 */
 
 /* 电脑监控屏：传感器行标签池（最多 PC_MON_MAX_SENSORS 行，懒加载创建一次） */
 static lv_obj_t *g_pcmon_screen = NULL;
@@ -890,6 +896,48 @@ static void tts_auto_cb(lv_event_t *e)
     g_tts_auto = lv_obj_has_state(sw, LV_STATE_CHECKED);
 }
 
+/* USB 模拟U盘开关：只置 pending，实际切换在主循环做（SD 卡操作阻塞） */
+static void usb_msc_switch_cb(lv_event_t *e)
+{
+    lv_obj_t *sw = lv_event_get_target(e);
+    bool on = lv_obj_has_state(sw, LV_STATE_CHECKED);
+    if (on && s_usb_msc_pending == 0) {
+        s_usb_msc_pending = 1;
+        if (g_usb_msc_label) lv_label_set_text(g_usb_msc_label, "正在切换U盘模式...");
+    } else if (!on && s_usb_msc_pending == 0) {
+        s_usb_msc_pending = -1;
+        if (g_usb_msc_label) lv_label_set_text(g_usb_msc_label, "正在恢复SD卡...");
+    }
+}
+
+/* 主循环调用：执行 U 盘模式切换（阻塞操作放这里，不卡 LVGL 回调） */
+static void usb_msc_periodic(void)
+{
+    if (s_usb_msc_pending == 0) return;
+    int cmd = s_usb_msc_pending;
+    s_usb_msc_pending = 0;
+
+    esp_err_t err;
+    if (cmd > 0) {
+        err = usb_msc_start();
+        if (g_usb_msc_label)
+            lv_label_set_text(g_usb_msc_label,
+                err == ESP_OK ? "U盘模式：SD卡已交给电脑" : "U盘启动失败，见串口日志");
+    } else {
+        err = usb_msc_stop();
+        if (g_usb_msc_label)
+            lv_label_set_text(g_usb_msc_label,
+                err == ESP_OK ? "U盘模式：关闭" : "恢复失败，请复位设备");
+    }
+
+    /* 用实际状态校正开关（失败时弹回） */
+    if (g_usb_msc_switch) {
+        bool active = usb_msc_is_active();
+        if (active) lv_obj_add_state(g_usb_msc_switch, LV_STATE_CHECKED);
+        else        lv_obj_clear_state(g_usb_msc_switch, LV_STATE_CHECKED);
+    }
+}
+
 /* 设置列表里的一条手机风格分隔线（左右各留 14px 缩进） */
 static void settings_add_separator(lv_obj_t *parent)
 {
@@ -1051,6 +1099,40 @@ static void build_settings_screen(lv_obj_t *scr)
     lv_obj_t *ttssw = lv_switch_create(ttsrow);
     /* 默认关：不 add_state；开关状态由 g_tts_auto 控制 */
     lv_obj_add_event_cb(ttssw, tts_auto_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    /* ---------- USB 模拟U盘 ---------- */
+    lv_obj_t *usbrow = lv_obj_create(list);
+    lv_obj_set_width(usbrow, LV_PCT(100));
+    lv_obj_set_height(usbrow, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(usbrow, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_opa(usbrow, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_radius(usbrow, 0, 0);
+    lv_obj_set_style_pad_hor(usbrow, 14, 0);
+    lv_obj_set_style_pad_top(usbrow, 14, 0);
+    lv_obj_set_style_pad_bottom(usbrow, 14, 0);
+    lv_obj_set_flex_flow(usbrow, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(usbrow, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(usbrow, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(usbrow, LV_SCROLLBAR_MODE_OFF);
+
+    lv_obj_t *usbl = lv_label_create(usbrow);
+    lv_label_set_text(usbl, "USB模拟U盘");
+    lv_obj_set_style_text_font(usbl, &lv_font_cn_16, 0);
+    lv_obj_set_style_text_color(usbl, lv_color_white(), 0);
+    lv_obj_clear_flag(usbl, LV_OBJ_FLAG_CLICKABLE);
+
+    g_usb_msc_switch = lv_switch_create(usbrow);
+    lv_obj_clear_state(g_usb_msc_switch, LV_STATE_CHECKED);   /* 默认关 */
+    lv_obj_add_event_cb(g_usb_msc_switch, usb_msc_switch_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    /* 状态提示（切换结果 / 电脑连接状态） */
+    g_usb_msc_label = lv_label_create(list);
+    lv_obj_set_width(g_usb_msc_label, LV_PCT(100));
+    lv_label_set_text(g_usb_msc_label, "开启后SD卡交给电脑，音乐/录音/TTS暂停");
+    lv_obj_set_style_text_font(g_usb_msc_label, &lv_font_cn_16, 0);
+    lv_obj_set_style_text_color(g_usb_msc_label, lv_color_hex(0x9AA0B5), 0);
+    lv_obj_set_style_pad_left(g_usb_msc_label, 14, 0);
+    lv_obj_clear_flag(g_usb_msc_label, LV_OBJ_FLAG_CLICKABLE);
 
     settings_add_separator(list);
 
@@ -5308,6 +5390,7 @@ static void lvgl_task(void *arg)
         ui_voice_refresh();           /* 语音：录完触发 ASR，识别结果填入输入框 */
         ui_pcmon_screen_refresh();    /* 内部已按活动屏保护 */
         file_mgr_periodic();          /* 文件命令队列，可能屏外触发，不门控 */
+        usb_msc_periodic();           /* USB 模拟U盘：执行延迟的 start/stop 切换 */
 
         /* 下面这些刷新只服务于各自专属屏，按当前活动 App 门控，避免每帧空跑 */
         if (g_active_app == APP_CLOCK) ui_clock_refresh();

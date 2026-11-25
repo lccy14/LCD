@@ -10,7 +10,7 @@ WiFi/BLE 扫描、电脑监控、贪吃蛇、小说阅读、设置等模块。
 
 | 部件 | 说明 |
 | --- | --- |
-| 主控 | ESP32-S3（**需带 PSRAM**，板载 8MB Flash） |
+| 主控 | ESP32-S3R8（内置 8MB Octal PSRAM，板载 8MB Flash）；第三版 PCB 为 `BOARD_REV=3` |
 | 屏幕 | ST7789，320×240，8 位并行（Intel I80）接口 |
 | 触摸 | FT6336（I2C，地址 `0x38`） |
 | 存储 | microSD 卡座，走 **SDMMC** 主机（非 SPI） |
@@ -21,7 +21,7 @@ WiFi/BLE 扫描、电脑监控、贪吃蛇、小说阅读、设置等模块。
 - LCD 走 8 位并行总线（`GPIO6/7/8/17/18/19/20/3` 为 D0~D7，`GPIO35/36/37/21/38` 为 DC/WR/CS/RST/BLK），**不是 SPI**。
 - LCD 的 `RD` 引脚必须在硬件上拉到 3.3V。
 - 触摸 I2C 已启用内部上拉，无需外部电阻。
-- SD 卡需预先格式化为 **FAT32**；代码先试 4 线模式，失败自动回退 1 线（只接 D0 也能用）。
+- SD 卡需预先格式化为 **FAT32**；第二版先试 4 线、失败回退 1 线；第三版固定 1 线（S3R8 的 IO35/36/37 被内部 PSRAM 占用，只接 CLK=39/CMD=38/D0=40）。
 
 ---
 
@@ -83,6 +83,12 @@ idf.py flash monitor
 - 音频文件点击进入**音乐播放器**。
 - 大图（解码结果超过 320×240 所需内存）会提示转成合适尺寸。
 
+### USB 模拟U盘
+- 设置页「USB模拟U盘」开关：开启后把 SD 卡通过 USB 暴露给电脑，电脑直接读写 `/sdcard` 的文件。
+- 硬件：ESP32-S3 USB OTG 用 **GPIO19(D-)/GPIO20(D+)**（第二/三版 PCB 已引出 USB 口；第三版这两脚空闲）；这两个脚与内置 USB Serial/JTAG 冲突，SDK 已关闭 USJ，调试仍走 UART0(GPIO43/44)。
+- 独占模型：U盘模式下 SD 卡交给电脑，设备端 FATFS 卸载，音乐/录音/TTS 自动暂停；关闭开关后自动重新挂载 FATFS、恢复功能。切换过程约几百 ms（SDMMC 重新初始化）。
+- 实现：`usb_msc.c` 用 `esp_tinyusb` 的 MSC（`tinyusb_msc_new_storage_sdmmc` + `MOUNT_USB`），依赖 `espressif/esp_tinyusb ^3.0.1`。切换在主循环做（不卡 LVGL 回调）。
+
 ### 图片查看
 - 支持 **JPG / PNG**；**不支持 BMP**。
 - 自动居中显示，超出屏幕部分按比例缩放。
@@ -90,7 +96,12 @@ idf.py flash monitor
 ### 音乐播放器
 硬件：ESP32-S3 I2S → **MAX98357AETE+T**（Class D 功放，3 线 BCLK/LRCK/DIN，无需 MCLK、无需 I2C 配置）。
 引脚在 `main/board.h` 的 `AUDIO_I2S_*` 宏集中定义，按**第二版 PCB** 接线：`BCLK=6 / LRCK=7 / DOUT→DIN=5 / SD_MODE=4`。SD_MODE 由软件控制：播放时拉高（功放工作），暂停/停止时拉低（关断、消除底噪滋滋声）。硬件侧该脚另有 10K 上拉到 VDD，GPIO 输出的低阻抗足以在需要时拉低。
-⚠️ `board.h` 顶部有 `BOARD_REV` 开关（默认 `2` = 第二版）。第二版把 LCD/触摸/SD 引脚也全部重排了，与第一版不兼容；手上仍是第一版板子时改成 `1` 再烧录，否则屏幕不亮、SD 挂不上。完整引脚表见 `wiring_diagram.txt`。
+⚠️ `board.h` 顶部有 `BOARD_REV` 开关，三版引脚不兼容，换板必须改对再烧录：
+- **`1`** = 第一版（旧引脚，无板载功放/麦克风）
+- **`2`** = 第二版（外接 Quad PSRAM，SD 4 线，背光 IO35）
+- **`3`**（默认）= 第三版 **ESP32-S3R8**（模组内置 8MB **Octal** PSRAM，SD **1 线**，背光 IO41）
+
+第三版的 IO35/36/37 被内部 PSRAM 占用，绝不能作 SD 的 D2/D1/D3；PSRAM 已切 `SPIRAM_MODE_OCT`（CLK=IO30/CS=IO26）。完整引脚表见 `wiring_diagram.txt`。
 
 界面：黑胶唱片封面 + 曲名 + 进度条（含当前/总时长）+ 音量条 + 四个按钮（上一首 / 播放·暂停 / 下一首 / 录音）。
 - 播放链路：开机 `audio_player_init()` 建 I2S 通道与后台任务（栈/缓冲放 PSRAM）→ WAV 直接取 PCM / MP3 经 **minimp3** 解码 → 统一转成 16bit 双声道 → `i2s_channel_write` 真实输出，**进度由实际送出的字节/采样数推进**，到尾自动下一首。

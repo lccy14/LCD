@@ -20,14 +20,15 @@
  *  板级版本开关
  * ------------------------------------------------------------
  *  1 = 第一版 PCB（旧引脚分配，无板载功放）
- *  2 = 第二版 PCB（默认，全部外设重新布线，音频走 GPIO4~7）
+ *  2 = 第二版 PCB（外接 Quad PSRAM，SD 4线，背光 IO35）
+ *  3 = 第三版 PCB（默认，ESP32-S3R8 内置 Octal PSRAM，SD 1线，背光 IO41）
  *
- *  ⚠️ 两版的 LCD / 触摸 / SD / 音频引脚完全不同，绝不能混用。
- *     如果手上还是第一版板子，把 BOARD_REV 改成 1 再烧录，
- *     否则 LCD 不会亮、SD 也挂不上。其它代码一行都不用动。
+ *  ⚠️ 三版的 LCD / 触摸 / SD / 音频 / 背光引脚不同，绝不能混用。
+ *     换板只改 BOARD_REV：1=第一版、2=第二版、3=第三版（默认）。
+ *     第三版芯片是 S3R8，IO35/36/37 被内部 PSRAM 占用，代码里已避开。
  * ============================================================ */
 #ifndef BOARD_REV
-#define BOARD_REV 2
+#define BOARD_REV 3
 #endif
 
 #define FT6336_I2C_ADDR     0x38    /* 主地址 */
@@ -75,12 +76,13 @@
 #define AUDIO_I2S_DOUT_GPIO    GPIO_NUM_11
 #define AUDIO_I2S_SD_MODE_GPIO GPIO_NUM_12
 
-#else
+#else  /* BOARD_REV == 2 或 3：公共引脚定义 + 末尾版本差异 */
 
-/* ===================== 第二版 PCB =====================
- * 依据第二版原理图 U6（ESP32-S3-WROOM-1）：黑色 IOx 为 GPIO 编号，
- * 蓝色下划线网络名为实际连接。以下逐一对应，勿与第一版混用。
- * ===================================================== */
+/* ===================== 第二/三版 PCB 公共引脚 =====================
+ * 依据原理图 U6：音频 IO4~7、触摸 IO15~18、LCD 数据 IO3/46/9/8/10~14/21/47/48/45、
+ * 麦克风 WS=IO1/SCK=IO2/SD=IO42、USB IO19/20、UART0 IO43/44 —— 两版完全一致。
+ * 【LCD 背光】和【SD 卡数据线】两版不同，在本块末尾用 #if BOARD_REV 区分。
+ * ================================================================ */
 
 /* ---------- 音频：MAX98357AETE+T（I2S 输入、Class D 功放） ----------
  * 原理图左侧引脚 4~7：SD_MODE / DIN / BCLK / LRCLK。
@@ -108,14 +110,14 @@
  * 原理图底部引脚 15~26，网络名是双模式复用标注（8080 / SPI）：
  *   IO46 = "DC\SPICLK"、IO9 = "WR/DC" —— 这里按代码实际使用的 8080 并口模式
  *   取前者，即 DC=IO46、WR=IO9。若硬件跳线成 SPI 模式，需改用 esp_lcd SPI 驱动。
- * IO45 = TE（ tearing effect 输入，代码未使用）；IO8 = RESET；IO35 = BL_EN。
+ * IO45 = TE（ tearing effect 输入，代码未使用）；IO8 = RESET。
+ * 背光 BL_EN 第二版=IO35、第三版=IO41（见文件末尾版本差异）。
  * ⚠️ GPIO45/46 是 ESP32-S3 的 strapping 引脚，外围不要加强上拉/下拉，
  *    否则会影响上电启动模式。 */
 #define LCD_CS_GPIO     GPIO_NUM_3   /* IO3  → CS */
 #define LCD_DC_GPIO     GPIO_NUM_46  /* IO46 → DC */
 #define LCD_WR_GPIO     GPIO_NUM_9   /* IO9  → WR */
 #define LCD_RST_GPIO    GPIO_NUM_8   /* IO8  → RESET */
-#define LCD_BLK_GPIO    GPIO_NUM_35  /* IO35 → BL_EN */
 #define LCD_TE_GPIO     GPIO_NUM_45  /* IO45 → TE（预留，代码未使用） */
 #define LCD_D0_GPIO     GPIO_NUM_10  /* IO10 */
 #define LCD_D1_GPIO     GPIO_NUM_11  /* IO11 */
@@ -127,15 +129,7 @@
 #define LCD_D7_GPIO     GPIO_NUM_48  /* IO48 */
 /* RD 引脚在并口只读屏幕必须接 3.3V，软件不控制 */
 
-/* ---------- SD 卡：SDMMC 4 线（裸 GPIO 号，sd_card.c 用 (gpio_num_t) 转换） ----------
- * 原理图右侧引脚 29~34：SD_DATA2/3、SD_CMD、SD_SCLK、SD_DATA0/1。
- * IO42 上的 "SD" 网络是卡座检测/控制信号，代码用 SDMMC_SLOT_NO_CD，未使用。 */
-#define SDMMC_PIN_CLK   39           /* IO39 → SD_SCLK */
-#define SDMMC_PIN_CMD   38           /* IO38 → SD_CMD */
-#define SDMMC_PIN_D0    40           /* IO40 → SD_DATA0 */
-#define SDMMC_PIN_D1    41           /* IO41 → SD_DATA1 */
-#define SDMMC_PIN_D2    36           /* IO36 → SD_DATA2 */
-#define SDMMC_PIN_D3    37           /* IO37 → SD_DATA3 */
+/* ---------- SD 卡引脚：见文件末尾的版本差异（第二版 4 线 / 第三版 1 线） ---------- */
 
 /* ---------- 麦克风：I2S 数字 MEMS（INMP441 / ICS-43432 等） ----------
  * 第二版预留引出脚，按用户实际飞线：WS=IO1、SCK(BCLK)=IO2、SD(数据)=IO42。
@@ -151,10 +145,37 @@
 /* 模块 L/R 引脚接 VDD 时数据在右声道，改成 1；接 GND(常见)保持 0 */
 #define MIC_SLOT_RIGHT     0
 
-/* 第二版其余已被占用 / 预留的脚，登记备查，勿复用：
- *   IO0(引脚27) 启动按键；IO19/IO20（引脚13/14，空闲引出）；
+/* ===================== 版本差异：背光 + SD 卡 ===================== */
+#if BOARD_REV == 2
+/* ---------- 第二版：背光 IO35，SD 4 线 ----------
+ * 注意：第二版用外接 Quad PSRAM（IO30/26），IO35/36/37 是普通 GPIO，可作 SD D3/D2/D1。 */
+#define LCD_BLK_GPIO    GPIO_NUM_35  /* IO35 → BL_EN */
+#define SDMMC_PIN_CLK   39           /* IO39 → SD_SCLK */
+#define SDMMC_PIN_CMD   38           /* IO38 → SD_CMD */
+#define SDMMC_PIN_D0    40           /* IO40 → SD_DATA0 */
+#define SDMMC_PIN_D1    41           /* IO41 → SD_DATA1 */
+#define SDMMC_PIN_D2    36           /* IO36 → SD_DATA2 */
+#define SDMMC_PIN_D3    37           /* IO37 → SD_DATA3 */
+
+#else  /* BOARD_REV == 3：第三版 S3R8 */
+/* ---------- 第三版：背光 IO41，SD 1 线 ----------
+ * ⚠️ S3R8 的 IO35/36/37 被模组内部 Octal PSRAM 占用，绝不可用！
+ *    IO41 从原 SD D1 让给 LCD 背光；SD 只用 CLK/CMD/D0 三根线。 */
+#define LCD_BLK_GPIO    GPIO_NUM_41  /* IO41 → BL_EN */
+#define SDMMC_PIN_CLK   39           /* IO39 → SD_SCLK */
+#define SDMMC_PIN_CMD   38           /* IO38 → SD_CMD */
+#define SDMMC_PIN_D0    40           /* IO40 → SD_DATA0 */
+/* 1 线用不到 D1~D3，但 sd_config_host_slot 的 4 线分支会引用这些宏，
+ * 给 NC 占位保证编译；运行时 width=1 不会真的配置它们。 */
+#define SDMMC_PIN_D1    GPIO_NUM_NC
+#define SDMMC_PIN_D2    GPIO_NUM_NC
+#define SDMMC_PIN_D3    GPIO_NUM_NC
+#endif
+
+/* 第三版其余已被占用 / 预留的脚，登记备查，勿复用：
+ *   IO0(引脚27) 启动按键；IO19/IO20（引脚13/14，USB OTG D-/D+）；
  *   TXD0/RXD0 = GPIO43/44（UART0 调试口）。
- */
+ *   IO35/36/37 第三版被内部 PSRAM 占用，第二版是 SD D3/D2/D1，第一版是 LCD。 */
 
 #endif /* BOARD_REV */
 

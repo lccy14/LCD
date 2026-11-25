@@ -1,6 +1,7 @@
 #include "sd_card.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/statvfs.h>
 #include <dirent.h>
@@ -33,8 +34,33 @@ sd_card_info_t g_sdcard = {0};
 
 static sdmmc_card_t *s_card = NULL;
 
-/* 按指定总线宽度初始化 SDMMC 主机并挂载 FATFS。
- * 1 线模式把 D1~D3 显式设成 NC，避免误用默认引脚。 */
+/* 配置 host/slot：1 线模式把 D1~D3 显式设成 NC，避免误用默认引脚。 */
+static void sd_config_host_slot(sdmmc_host_t *host, sdmmc_slot_config_t *slot,
+                                int width, int freq_khz)
+{
+    *host = (sdmmc_host_t)SDMMC_HOST_DEFAULT();
+    host->max_freq_khz = freq_khz;
+
+    *slot = (sdmmc_slot_config_t)SDMMC_SLOT_CONFIG_DEFAULT();
+    slot->width = width;
+    slot->clk   = (gpio_num_t)SDMMC_PIN_CLK;
+    slot->cmd   = (gpio_num_t)SDMMC_PIN_CMD;
+    slot->d0    = (gpio_num_t)SDMMC_PIN_D0;
+    if (width >= 4) {
+        slot->d1 = (gpio_num_t)SDMMC_PIN_D1;
+        slot->d2 = (gpio_num_t)SDMMC_PIN_D2;
+        slot->d3 = (gpio_num_t)SDMMC_PIN_D3;
+    } else {
+        slot->d1 = GPIO_NUM_NC;
+        slot->d2 = GPIO_NUM_NC;
+        slot->d3 = GPIO_NUM_NC;
+    }
+    slot->cd = SDMMC_SLOT_NO_CD;      /* 卡座无 CD/WP 检测脚 */
+    slot->wp = SDMMC_SLOT_NO_WP;
+    slot->flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;   /* 外部没上拉时先靠内部上拉顶一下 */
+}
+
+/* 按指定总线宽度初始化 SDMMC 主机并挂载 FATFS。 */
 static esp_err_t mount_with_width(int width, int freq_khz)
 {
     esp_vfs_fat_sdmmc_mount_config_t mount_cfg = {
@@ -45,26 +71,9 @@ static esp_err_t mount_with_width(int width, int freq_khz)
         .use_one_fat            = false,
     };
 
-    sdmmc_host_t host = SDMMC_HOST_DEFAULT();
-    host.max_freq_khz = freq_khz;
-
-    sdmmc_slot_config_t slot = SDMMC_SLOT_CONFIG_DEFAULT();
-    slot.width = width;
-    slot.clk   = (gpio_num_t)SDMMC_PIN_CLK;
-    slot.cmd   = (gpio_num_t)SDMMC_PIN_CMD;
-    slot.d0    = (gpio_num_t)SDMMC_PIN_D0;
-    if (width >= 4) {
-        slot.d1 = (gpio_num_t)SDMMC_PIN_D1;
-        slot.d2 = (gpio_num_t)SDMMC_PIN_D2;
-        slot.d3 = (gpio_num_t)SDMMC_PIN_D3;
-    } else {
-        slot.d1 = GPIO_NUM_NC;
-        slot.d2 = GPIO_NUM_NC;
-        slot.d3 = GPIO_NUM_NC;
-    }
-    slot.cd = SDMMC_SLOT_NO_CD;      /* 卡座无 CD/WP 检测脚 */
-    slot.wp = SDMMC_SLOT_NO_WP;
-    slot.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;   /* 外部没上拉时先靠内部上拉顶一下 */
+    sdmmc_host_t host;
+    sdmmc_slot_config_t slot;
+    sd_config_host_slot(&host, &slot, width, freq_khz);
 
     sdmmc_card_t *card = NULL;
     esp_err_t err = esp_vfs_fat_sdmmc_mount(SD_MOUNT_POINT, &host, &slot, &mount_cfg, &card);
@@ -116,26 +125,27 @@ static esp_err_t mount_with_retry(int width, int freq_khz)
     return err;
 }
 
-/* 挂载尝试顺序（(宽度, 时钟)）：
- *   1) 1 线 40MHz   —— 本次试验主档：只留 D0 避开 D1~D3 走线不等长问题，
- *                      同时把时钟拉到 SD High Speed 上限（SDMMC_FREQ_HIGHSPEED）。
- *                      注意：卡不支持 HS 时驱动会自行降到 20MHz，看日志的「实际」值。
- *   2) 1 线 4MHz    —— 40MHz 在 GPIO 矩阵 + 内部上拉下容易 CRC/超时，回退保底
- *   3) 4 线 4MHz    —— 4 线降速重试
- *   4) 4 线 40MHz   —— 4 线高速（卡座信号好时使用）
- */
+/* 挂载尝试顺序（(宽度, 时钟)）按板级版本区分：
+ * 第二版：1线40M → 1线4M → 4线4M → 4线40M（外接 Quad PSRAM，IO35/36/37 可用作 SD）。
+ * 第三版：只 1 线（S3R8 的 IO35/36/37 被内部 PSRAM 占用，绝不能配成 D2/D3）。 */
 typedef struct { int width; int freq_khz; } sd_try_t;
+#if BOARD_REV >= 3
 static const sd_try_t s_try_list[] = {
     { 1, SD_FREQ_KHZ },     /* 1 线 40MHz */
     { 1, 4000 },            /* 40MHz 不稳时回退 1 线 4MHz */
-    { 4, 4000 },            /* 4 线降速重试 */
-    { 4, SD_FREQ_KHZ },     /* 4 线 40MHz */
 };
+#else
+static const sd_try_t s_try_list[] = {
+    { 1, SD_FREQ_KHZ },
+    { 1, 4000 },
+    { 4, 4000 },
+    { 4, SD_FREQ_KHZ },
+};
+#endif
 
-/* 4 线全部失败后的「体检」：用 400kHz（SD 初始化速率，几乎不受走线影响）探一次。
- *   成功 → D1~D3 是接通的，只是高速下信号质量差（缺 10k 上拉 / 走线不等长）；
- *   失败 → D1/D2/D3(GPIO48/1/2) 大概率没接或接错，只能一直用 1 线。
- * 探测成功后立刻卸载，不留在 400kHz（比 1 线 40MHz 慢得多）。 */
+#if BOARD_REV < 3
+/* 4 线全部失败后的体检（仅第二版）：用 400kHz 探一次 D1~D3 是否接通。
+ * 成功 → 走线通、只是高速信号质量差；失败 → D1/D2/D3 没接/接错，只能用 1 线。 */
 static void probe_4bit_lowspeed(void)
 {
     if (mount_with_width(4, SDMMC_FREQ_PROBING) == ESP_OK) {
@@ -148,6 +158,7 @@ static void probe_4bit_lowspeed(void)
                  SDMMC_FREQ_PROBING, SDMMC_PIN_D1, SDMMC_PIN_D2, SDMMC_PIN_D3);
     }
 }
+#endif
 
 esp_err_t sd_card_mount(bool width4)
 {
@@ -157,24 +168,28 @@ esp_err_t sd_card_mount(bool width4)
 
     sd_log_heap("挂载前");
 
+#if BOARD_REV >= 3
+    (void)width4;   /* 第三版 SD 固定 1 线，忽略调用方的 width4 参数 */
+#endif
     esp_err_t err = ESP_FAIL;
     for (size_t i = 0; i < sizeof(s_try_list) / sizeof(s_try_list[0]); i++) {
         int w = s_try_list[i].width;
         int f = s_try_list[i].freq_khz;
-        if (w == 4 && !width4) {
-            continue;                       /* 调用方只要 1 线 */
-        }
+#if BOARD_REV < 3
+        if (w == 4 && !width4) continue;   /* 调用方只要 1 线 */
+#endif
         err = mount_with_retry(w, f);
         if (err == ESP_OK) {
             return ESP_OK;
         }
+#if BOARD_REV < 3
         if (w == 4 && err == ESP_ERR_INVALID_CRC) {
             ESP_LOGW(TAG, "4 线 %d kHz 数据 CRC 错误：D1~D3 走线/上拉不良，尝试降速", f);
         }
-        /* 4 线档位全部试完仍失败（即将退回 1 线）时，做一次 400kHz 体检 */
         if (w == 4 && f == 4000 && width4) {
             probe_4bit_lowspeed();
         }
+#endif
     }
 
     if (err != ESP_OK) {
@@ -282,4 +297,49 @@ int sd_prune_files(const char *prefix, const char *ext, int keep)
     }
     if (removed) ESP_LOGI(TAG, "pruned %d old files (%s*%s), kept %d", removed, prefix, ext, keep);
     return removed;
+}
+
+/* ---- USB MSC 独占用：裸 SDMMC 初始化（不挂 FATFS） ---- */
+static int s_last_width = 1;
+static int s_last_freq  = SD_FREQ_KHZ;
+
+/* 记录当前已验证成功的总线参数，供 MSC 模式复用（unmount 会清 g_sdcard） */
+void sd_card_save_params(void)
+{
+    if (g_sdcard.width > 0) {
+        s_last_width = g_sdcard.width;
+        s_last_freq  = g_sdcard.freq_khz > 0 ? g_sdcard.freq_khz : SD_FREQ_KHZ;
+    }
+}
+
+esp_err_t sd_card_raw_init(sdmmc_card_t **out_card)
+{
+    if (!out_card) return ESP_ERR_INVALID_ARG;
+    *out_card = NULL;
+    sdmmc_host_t host;
+    sdmmc_slot_config_t slot;
+    sd_config_host_slot(&host, &slot, s_last_width, s_last_freq);
+
+    sdmmc_card_t *card = (sdmmc_card_t *)calloc(1, sizeof(sdmmc_card_t));
+    if (!card) { ESP_LOGE(TAG, "raw init: calloc card failed"); return ESP_ERR_NO_MEM; }
+    esp_err_t err = sdmmc_host_init();
+    if (err != ESP_OK) { ESP_LOGE(TAG, "raw init: host_init %s", esp_err_to_name(err)); free(card); return err; }
+    err = sdmmc_host_init_slot(host.slot, &slot);
+    if (err != ESP_OK) { ESP_LOGE(TAG, "raw init: init_slot %s", esp_err_to_name(err)); sdmmc_host_deinit(); free(card); return err; }
+    err = sdmmc_card_init(&host, card);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "raw init: card_init %s (%d线 %d kHz)", esp_err_to_name(err), s_last_width, s_last_freq);
+        sdmmc_host_deinit(); free(card); return err;
+    }
+    *out_card = card;
+    ESP_LOGI(TAG, "raw init OK: %d线 %d kHz, %u 扇区", s_last_width, s_last_freq,
+             (unsigned)card->csd.capacity);
+    return ESP_OK;
+}
+
+void sd_card_raw_deinit(sdmmc_card_t *card)
+{
+    sdmmc_host_deinit();
+    free(card);
+    ESP_LOGI(TAG, "raw deinit OK");
 }
