@@ -2,7 +2,7 @@
 
 基于 **ESP32-S3 + ST7789（320×240，8 位并行 I80 接口） + FT6336 电容触摸 + microSD 卡** 的多功能设备固件，
 使用 **LVGL v9** 图形库，在 320×240 的小屏上集成了文件浏览、图片查看、音乐播放器、天气、时钟闹钟、
-WiFi/BLE 扫描、电脑监控、贪吃蛇、小说阅读、设置等模块。
+WiFi/BLE 扫描、USB 网络共享、自动熄屏、系统诊断、电脑监控、贪吃蛇、小说阅读、设置等模块。
 
 ---
 
@@ -106,12 +106,15 @@ idf.py flash monitor
 
 ### USB 网络共享（NCM）
 - 设置页「USB网络共享」开关：开启后电脑插 USB 出现一块网卡，**经 ESP32 的 WiFi STA 上网**（相当于 USB 网卡）。
-- 前提：先连上 WiFi（设置页 WiFi 已连接），否则启动会失败并提示。
+- 前提：先在 **WiFi App 页**打开 WiFi 并连上路由器，否则启动会失败并提示。关闭 WiFi App 页开关时会自动停掉 USB 网络共享；重新打开 WiFi 后需手动再开一次 NCM。
 - 实现：`usb_ncm.c` 用 **NAPT 网关**模式（不是 L2 桥）——USB NCM 创建独立 netif（192.168.4.1/24 + DHCP server），电脑拿 192.168.4.x；`esp_netif_napt_enable()` 把 USB 子网流量经 WiFi STA 转发出去。电脑和设备**各用独立 IP**，互不干扰。
 - 为什么不用 L2 桥：L2 桥共用 WiFi STA 的 MAC/IP，设备自己收不到 DNS 响应（`getaddrinfo` EAI_AGAIN / 202），或两边 TCP 栈抢同一个 IP 导致都没网（电脑显示 0 bps）。NAPT 是标准"网络共享"方案，设备自己联网不受影响。
+- DNS：DHCP server 不再把 DNS 下发成 `192.168.4.1`（设备自身没有 DNS 服务），而是在启动 DHCP 前读取 WiFi STA 的上游 DNS；取不到时回退到 STA 网关（例如 `192.168.1.1`）。电脑 `ipconfig /all` 里 USB 网卡 DNS 应为上游路由/网关。
+- TX 缓冲：`usb_netif_transmit()` 交给 `tinyusb_net_send_sync()` 的 buffer 是 lwIP pbuf payload，归 lwIP 所有；不能由 USB 回调 `free()`。当前实现关闭 `free_tx_buffer`，同步发送返回后再由 lwIP 正常释放，避免堆损坏/随机重启。
+- 吞吐优化：WiFi STA 已调用 `esp_wifi_set_ps(WIFI_PS_NONE)` 关闭 modem sleep；TCP 默认发送/接收窗口从 5760 提到 16384（见 `sdkconfig` / `sdkconfig.defaults`）。USB Full Speed 原始 12Mbps，实测通常 3~8Mbps，受 WiFi 信号和上游带宽影响。
 - ⚠️ 两个版本差异坑：① MAC 字符串索引必须对齐 `STRID_MAC=7`，由 `tinyusb_net_init()` 内部写 ASCII MAC，不要自己构造 UTF-16LE（会被 `strnlen` 截断成空串，枚举卡住）；② 新版 TinyUSB 的 NCM 不调用 `tud_network_init_cb()`，`on_init_callback` 不触发，改用 `ncm_monitor_task` 轮询 `tud_mounted()` 报告枚举状态。
-- 与 U盘 / 声卡 / CDC **四选一互斥**（共用 USB 口），切换在主循环做。NTB buffer：OUT=1×2048，IN=3×2048（IN 少于 3 会疯狂丢包）。发送缓冲满的丢包日志降频为每 100 次汇总一次。USB Full Speed 带宽上限 ~1MB/s，大流量场景仍受限。
-- 配置：`CONFIG_LWIP_IP_FORWARD=y` + `CONFIG_LWIP_IPV4_NAPT=y` + `CONFIG_TINYUSB_NET_MODE_NCM=y` + NCM buffer（sdkconfig.defaults 持久化）。
+- 与 U盘 / 声卡 / CDC **四选一互斥**（共用 USB 口），切换在主循环做。NTB buffer：OUT=1×2048，IN=3×2048（IN 少于 3 会疯狂丢包）。发送缓冲满的丢包日志降频为每 100 次汇总一次。
+- 配置：`CONFIG_LWIP_IP_FORWARD=y` + `CONFIG_LWIP_IPV4_NAPT=y` + `CONFIG_TINYUSB_NET_MODE_NCM=y` + NCM buffer + TCP 窗口 16384（sdkconfig.defaults 持久化）。
 
 ### 图片查看
 - 支持 **JPG / PNG**；**不支持 BMP**。
@@ -151,7 +154,7 @@ idf.py flash monitor
 
 ### 天气 / 时钟 / 闹钟
 - 需要 **WiFi 联网**：时钟通过 NTP 同步时间，天气通过在线接口获取。
-- 首次使用请在「设置」或对应界面配置 WiFi。
+- 首次使用请在 **WiFi App 页**打开 WiFi 并连接路由器。
 - 数据源 **sojson**（又拍云 CDN，`t.weather.sojson.com`，国内直连、免 Key）：按城市代码一次 HTTP 取实况（温度/湿度/天气中文描述），响应约 100ms。原 Open-Meteo 域名解析到欧洲 OVH 节点，跨境丢 SYN 导致 15s 超时，已弃用。
   城市名→代码映射内置常见城市（`weather.c` 的 `s_city_codes`），查不到回退深圳；当前固定 `WX_MANUAL_CITY="Shenzhen"`，无城市切换 UI。sojson 只支持明文 HTTP（天气数据不敏感），超时 8s，失败按 60 秒退避重试。
   天气页展示 5 行：城市 / 温度+天气 / 今日温区+风向风力 / 湿度+空气质量+PM2.5 / 更新时间（溢出时曾试过 7 行含日出日落与生活提示，内容过多且提示会换行超出屏幕，已删减）。sojson 实况无精确风速（km/h），用风向+风力等级（如「东北风2级」）代替。无刷新按钮：进入天气页自动拉一次，之后每 10 分钟刷新（失败按 60 秒重试）。
@@ -175,6 +178,21 @@ idf.py flash monitor
 
 ### WiFi 扫描 / BLE 扫描
 - 扫描附近的 WiFi 网络 / BLE 设备并显示列表。
+- **WiFi 开关在 WiFi App 页表头**：开启时启动 WiFi STA 并扫描；关闭时 `esp_wifi_stop()`，清空状态，并自动停止 USB 网络共享；再次开启会用已保存的账号密码自动重连。
+- **BLE 开关在蓝牙 App 页表头**：BLE 默认关闭，不进入蓝牙 App 时不初始化 NimBLE，不占射频和蓝牙内存；进入蓝牙 App 或打开该开关时才初始化并扫描 10 秒；关闭时停止扫描（不反复 deinit 控制器）。
+
+### 系统诊断
+- 入口：设置页「系统诊断」。
+- 页面每行一个独立标签，按状态着色：蓝色为分组标题，绿色为正常，橙色为警告，红色为异常，灰色为未启用/未连接。
+- 显示内容：
+  - 运行时长 / 帧率
+  - 复位原因 / 任务数
+  - 内部 RAM：空闲、历史最低、最大空闲块
+  - PSRAM：空闲、最大空闲块
+  - WiFi 状态；已连接时附带 IP
+  - USB 模式：NCM / CDC / U盘 / 声卡 / 未启用
+  - SD 卡：线数、实际时钟、理论带宽
+- 内部 RAM 历史最低值使用 `heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL)`，不会把 PSRAM 混进去。
 
 ### 电脑监控
 - 在电脑端运行配套程序（见 `tools/`），经 WiFi 把电脑状态上报到设备显示。
@@ -191,9 +209,11 @@ idf.py flash monitor
 
 ### 设置
 - **亮度**：10%~100% 滑块，LEDC PWM 调 LCD 背光。
+- **自动熄屏**：开关，默认开；30 秒无触摸把背光 PWM 调到 0%，任意触摸唤醒；闹钟触发时也会自动点亮。关闭该开关后不会再自动熄屏。熄屏不修改用户设置的亮度值。
 - **喇叭音量**：0%~100% 滑块，`audio_player` 软件数字增益（MAX98357A 无硬件音量控制，靠 I2S 数据缩放）。默认 80%，掉电不保存。
 - **AI回复自动播报**：开关，默认关；开启后每条 AI 回复自动 TTS 播报，关闭时可点 AI 气泡手动播。
-- 其他配置项（WiFi 等）见源码对应模块。
+- **系统诊断**：打开系统诊断页，查看运行时长、帧率、复位原因、任务数、内存/PSRAM 空闲与最大空闲块、WiFi 状态/IP、USB 模式、SD 卡线数/时钟/理论带宽。
+- 其他配置项（WiFi、BLE 等）见对应 App 页表头开关与源码模块。
 
 ---
 
@@ -202,7 +222,7 @@ idf.py flash monitor
 ```
 .
 ├── main/                 # 应用代码
-│   ├── ui.c              # 主界面与各应用 UI（图片/音乐/天气/游戏/...）
+│   ├── ui.c              # 主界面与各应用 UI（图片/音乐/天气/游戏/系统诊断/...）
 │   ├── audio_player.c    # 播放引擎：WAV/MP3 解码 → I2S0 → MAX98357A
 │   ├── mic_rec.c         # 录音引擎：I2S1 麦克风 → 16bit WAV → /sdcard
 │   ├── ai_chat.c/.h      # AI 聊天：多平台 HTTPS POST + NVS 分平台 Key + PSRAM 后台任务
@@ -251,6 +271,15 @@ A：SD 卡 FATFS 须用 UTF-8 + CP936（已在 `sdkconfig.defaults` 开启）。
 
 **Q：SD 卡识别不了？**
 A：确认卡为 FAT32；检查接线（尤其 SD CLK/CMD/D0）；4 线不稳可只接 D0 走 1 线模式。
+
+**Q：USB 网络共享能拿到 IP 但上不了网？**
+A：在电脑命令行执行 `ipconfig /all`，确认 USB 网卡的 DNS 不是 `192.168.4.1`。当前固件会下发 WiFi STA 的上游 DNS 或上游网关（如 `192.168.1.1`）。如果仍是旧值，禁用/启用 USB 网卡或执行 `ipconfig /release && ipconfig /renew` 重新获取地址。
+
+**Q：USB 网络共享速度偏慢？**
+A：ESP32-S3 USB OTG 是 Full Speed（12Mbps 原始速率），经 NCM + NAPT + WiFi 后实测通常约 3~8Mbps。固件已关闭 WiFi modem sleep，并把 TCP 窗口调到 16384；如果仍慢，先确认电脑自身 WiFi 已关闭、流量确实走 USB 网卡，再检查 WiFi RSSI 和上游外网带宽。
+
+**Q：系统诊断页里“内部 RAM 历史最低”比“空闲”大很多？**
+A：历史最低必须和空闲是在同一类内存上统计。当前代码用 `MALLOC_CAP_INTERNAL` 只统计内部 RAM；不要改回 `esp_get_minimum_free_heap_size()`，那个接口统计 `MALLOC_CAP_DEFAULT`，会把 PSRAM 混进去。
 
 ---
 
