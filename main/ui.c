@@ -20,6 +20,8 @@
 #include "freertos/task.h"
 #include "esp_timer.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
+#include "esp_system.h"      /* esp_reset_reason / esp_get_minimum_free_heap_size */
 #include "esp_heap_caps.h"   /* heap_caps_malloc PSRAM for prerender_home_bg */
 #include "snake.h"            /* 贪吃蛇 */
 #include "novel_text.h"
@@ -32,6 +34,9 @@
 #include "voice_asr.h"        /* 语音输入：录音 WAV → 智谱 ASR → 文字 */
 #include "voice_tts.h"        /* 语音输出：AI 回复 → 智谱 TTS → WAV 播放 */
 #include "usb_msc.h"          /* USB 模拟U盘：SD 卡通过 USB 暴露给电脑 */
+#include "usb_uac.h"          /* USB 声卡：电脑播放/录音经 ESP32 的功放和麦克风 */
+#include "usb_cdc.h"          /* USB CDC 虚拟串口：调试/上位机控制 */
+#include "usb_ncm.h"          /* USB 网络共享：电脑经 ESP32 WiFi 上网 */
 #include "src/widgets/ime/lv_ime_pinyin.h"  /* 拼音输入法：键盘打中文 */
 #include "lv_pinyin_dict_cn.h" /* 简体拼音字典（2 万字，覆盖内置字典缺的字） */
 #include <dirent.h>           /* 音乐：扫描 SD 卡音频文件（opendir/readdir） */
@@ -46,6 +51,10 @@ TaskHandle_t g_lvgl_task = NULL;
  * 覆盖 ASCII 32-127 + 界面所需的全部汉字，英文字形也来自该字体。
  * 注意：LVGL 内置 montserrat 不含汉字，凡是要显示中文的标签都必须显式设置为它。 */
 LV_FONT_DECLARE(lv_font_cn_16);
+/* 诊断页用 14px ASCII + 16px 中文回退，能多塞几行信息 */
+LV_FONT_DECLARE(lv_font_montserrat_14);
+static lv_font_t s_log_font;
+
 /* degree 字体只含「°」一个符号，并以 lv_font_cn_16 作回退；
  * 用它作界面字体即可在中文之外正常显示「°C」，无需改动中文字库。 */
 LV_FONT_DECLARE(degree);
@@ -162,6 +171,11 @@ static lv_obj_t *g_detail_label = NULL;
 static lv_obj_t *g_net_cont = NULL;
 static lv_obj_t *g_subtitle = NULL;
 static bool      g_wifi_on = true;
+static lv_obj_t *g_wifi_page_switch = NULL;
+static lv_obj_t *g_ble_page_switch = NULL;
+static lv_obj_t *g_ble_subtitle = NULL;
+static bool      g_ble_on = false;      /* BLE 开机默认关，进 App 或开关打开才初始化 */
+static bool      s_radio_syncing = false;
 
 /* 状态栏上的 WiFi 连接状态指示。
  * 每个界面都有自己的状态栏（make_status_bar 会被复用），所以这里保存所有实例统一刷新。 */
@@ -212,6 +226,10 @@ static lv_obj_t *g_ble_screen = NULL;
 static lv_obj_t *g_settings_screen = NULL;
 static lv_obj_t *g_clock_screen = NULL;
 static lv_obj_t *g_timer_screen = NULL;
+static lv_obj_t *g_log_screen = NULL;
+static lv_obj_t *g_log_label = NULL;              /* 兼容原有“是否在诊断页”的判定 */
+#define DIAG_LABEL_COUNT 11
+static lv_obj_t *g_diag_labels[DIAG_LABEL_COUNT] = {0};
 static lv_obj_t *g_alarm_screen = NULL;
 static lv_obj_t *g_music_screen = NULL;
 static lv_obj_t *g_files_screen = NULL;   /* 文件管理 */
@@ -267,6 +285,15 @@ static bool      g_tts_auto = false;   /* AI 回复自动播报开关（设置�
 static int       s_usb_msc_pending = 0;   /* 0=无 1=请求开启 -1=请求关闭 */
 static lv_obj_t *g_usb_msc_label = NULL;  /* 设置页里的状态提示 label */
 static lv_obj_t *g_usb_msc_switch = NULL; /* 设置页里的 U 盘开关 */
+static int       s_usb_uac_pending = 0;   /* USB 声卡：0=无 1=开 -1=关 */
+static lv_obj_t *g_usb_uac_label = NULL;
+static lv_obj_t *g_usb_uac_switch = NULL;
+static int       s_usb_cdc_pending = 0;   /* USB CDC 调试口：0=无 1=开 -1=关 */
+static lv_obj_t *g_usb_cdc_label = NULL;
+static lv_obj_t *g_usb_cdc_switch = NULL;
+static int       s_usb_ncm_pending = 0;   /* USB 网络共享：0=无 1=开 -1=关 */
+static lv_obj_t *g_usb_ncm_label = NULL;
+static lv_obj_t *g_usb_ncm_switch = NULL;
 
 /* 电脑监控屏：传感器行标签池（最多 PC_MON_MAX_SENSORS 行，懒加载创建一次） */
 static lv_obj_t *g_pcmon_screen = NULL;
@@ -300,15 +327,27 @@ static int g_pending_app = -1;
 static app_id_t g_active_app = APP_NONE;
 /* 系统信息屏 1s 刷新定时器（仅在“关于本机”屏可见时才运行，避免无谓刷新不可见标签） */
 static lv_timer_t *g_sysinfo_timer = NULL;
-/* 前向声明：计时器 构建函数与每帧更新（定义见文件后部） */
+/* 前向声明：计时器 / 系统诊断 构建函数与每帧更新（定义见文件后部） */
 static void build_timer_screen(lv_obj_t *parent);
 static void ui_timer_update(void);
+static void build_log_screen(lv_obj_t *parent);
+static void ui_log_screen_refresh(void);
+static void backlight_set(uint8_t percent);
+static void screen_wake(void);
 
 /* 触摸相关：FT6336 实时坐标 + 屏幕上的红色指示点 */
 static lv_obj_t      *g_red_dot = NULL;
 static int32_t       g_touch_x = 0;
 static int32_t       g_touch_y = 0;
 static bool          g_touch_pressed = false;
+
+/* 空闲熄屏：30 秒无触摸自动灭背光，任意触摸唤醒 */
+#define SCREEN_SLEEP_MS  30000
+static bool          g_sleep_enabled = true;
+static bool          s_screen_sleeping = false;
+static uint32_t      s_last_touch_ms = 0;
+static uint8_t       s_wake_brightness = 100;   /* 唤醒时恢复的用户亮度 */
+
 
 /* LVGL 输入设备回调：读取 FT6336，把坐标喂给 LVGL。
  * 优化: 先查 INT 引脚电平, 高=无触摸立即返回, 避免每帧阻塞读 I2C。
@@ -338,6 +377,7 @@ static void touch_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
         g_touch_x = sx;
         g_touch_y = sy;
         g_touch_pressed = true;
+        screen_wake();                      /* 触摸唤醒 */
         data->point.x = sx;
         data->point.y = sy;
         data->state = LV_INDEV_STATE_PRESSED;
@@ -347,20 +387,75 @@ static void touch_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
     }
 }
 
-/* Wi-Fi 开关：开 -> 触发扫描；关 -> 清空列表 */
-static void switch_cb(lv_event_t *e)
+/* 同步 App 页开关状态（程序改状态时避免回调递归） */
+static void radio_sync_switches(void)
 {
-    lv_obj_t *sw = lv_event_get_target(e);
-    g_wifi_on = lv_obj_has_state(sw, LV_STATE_CHECKED);
-    if (g_wifi_on) {
+    s_radio_syncing = true;
+    if (g_wifi_page_switch) {
+        if (g_wifi_on) lv_obj_add_state(g_wifi_page_switch, LV_STATE_CHECKED);
+        else           lv_obj_clear_state(g_wifi_page_switch, LV_STATE_CHECKED);
+    }
+    if (g_ble_page_switch) {
+        if (g_ble_on) lv_obj_add_state(g_ble_page_switch, LV_STATE_CHECKED);
+        else          lv_obj_clear_state(g_ble_page_switch, LV_STATE_CHECKED);
+    }
+    s_radio_syncing = false;
+}
+
+/* WiFi 总开关：真正启停 STA；关闭时同时停掉 USB 网络共享 */
+static void apply_wifi_switch(bool on)
+{
+    g_wifi_on = on;
+    if (on) {
+        wifi_set_enabled(true);
         wifi_scan_trigger();
-        lv_label_set_text(g_subtitle, "扫描中...");
+        if (g_subtitle) lv_label_set_text(g_subtitle, "扫描中...");
     } else {
-        lv_label_set_text(g_subtitle, "无线已关闭");
+        /* NCM 依赖 WiFi，先让主循环停掉 USB 网络共享 */
+        if (usb_ncm_is_active()) {
+            if (g_usb_ncm_switch) lv_obj_clear_state(g_usb_ncm_switch, LV_STATE_CHECKED);
+            else                  s_usb_ncm_pending = -1;
+        }
+        wifi_set_enabled(false);
+        if (g_subtitle) lv_label_set_text(g_subtitle, "无线已关闭");
         for (int i = 0; i < WIFI_LIST_ROWS; i++) {
             lv_obj_add_flag(g_rows[i].row, LV_OBJ_FLAG_HIDDEN);
         }
     }
+    radio_sync_switches();
+}
+
+/* BLE 总开关：默认关，打开时才初始化 NimBLE 并扫描 */
+static void apply_ble_switch(bool on)
+{
+    g_ble_on = on;
+    if (on) {
+        ble_scan_set_enabled(true);
+        ble_scan_trigger();
+        if (g_ble_subtitle) lv_label_set_text(g_ble_subtitle, "扫描中...");
+    } else {
+        ble_scan_set_enabled(false);
+        if (g_ble_subtitle) lv_label_set_text(g_ble_subtitle, "蓝牙已关闭");
+        for (int i = 0; i < BLE_LIST_ROWS; i++) {
+            lv_obj_add_flag(g_ble_rows[i].row, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    radio_sync_switches();
+}
+
+/* WiFi / BLE App 页原有开关回调 */
+static void switch_cb(lv_event_t *e)
+{
+    if (s_radio_syncing) return;
+    lv_obj_t *sw = lv_event_get_target(e);
+    apply_wifi_switch(lv_obj_has_state(sw, LV_STATE_CHECKED));
+}
+
+static void ble_switch_cb(lv_event_t *e)
+{
+    if (s_radio_syncing) return;
+    lv_obj_t *sw = lv_event_get_target(e);
+    apply_ble_switch(lv_obj_has_state(sw, LV_STATE_CHECKED));
 }
 
 /* 刷新所有状态栏上的 WiFi 图标 + WiFi 界面副标题。
@@ -818,25 +913,48 @@ static uint8_t   g_brightness = BLK_DEFAULT_PERCENT;
 static lv_obj_t *g_br_label   = NULL;   /* 亮度百分比数字标签 */
 static lv_obj_t *g_vol_label  = NULL;   /* 音量百分比数字标签 */
 
-/* 设置背光亮度（percent: BLK_MIN_PERCENT ~ 100） */
+/* 直接写 PWM 占空比，允许 0%（熄屏）；不修改 g_brightness */
+static void backlight_raw_set(uint8_t percent)
+{
+    if (percent > 100) percent = 100;
+    uint32_t duty = (uint32_t)BLK_MAX_DUTY * percent / 100;
+    /* 注意：不能用 ledc_set_duty_and_update()！它属于 fade 系列 API，
+     * 未安装 fade 服务时会直接返回 ESP_FAIL，占空比根本不会写入。
+     * ledc_set_duty + ledc_update_duty 走非 fade 通路，不需要 fade 服务。 */
+    esp_err_t e1 = ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty);
+    esp_err_t e2 = ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+    if (e1 != ESP_OK || e2 != ESP_OK) {
+        ESP_LOGE("BLK", "duty %lu failed (set=%d upd=%d)", (unsigned long)duty, (int)e1, (int)e2);
+    }
+}
+
+/* 设置背光亮度（percent: BLK_MIN_PERCENT ~ 100），同时记录用户亮度 */
 static void backlight_set(uint8_t percent)
 {
     if (percent < BLK_MIN_PERCENT) percent = BLK_MIN_PERCENT;
     if (percent > 100) percent = 100;
     g_brightness = percent;
-    uint32_t duty = (uint32_t)BLK_MAX_DUTY * percent / 100;
-    /* 注意：不能用 ledc_set_duty_and_update()！
-     * 它属于 fade 系列的线程安全 API，内部会先检查 fade 服务是否已安装，
-     * 未安装时会直接返回 ESP_FAIL 并打印 "Fade service not installed"，
-     * 占空比根本不会写入（readback 一直是初始值）。
-     * ledc_set_duty + ledc_update_duty 走的是非 fade 通路，不需要 fade 服务。 */
-    esp_err_t e1 = ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty);
-    esp_err_t e2 = ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
-    /* 注：不要在这里用 ledc_get_duty() 做校验。它直接读硬件 duty 寄存器，
-     * 而新占空比要等下一个 PWM 周期才生效，紧跟着读必然读到「上一次」的值，
-     * 看起来像没写进去，其实是正常现象。用示波器看波形最准。 */
-    if (e1 != ESP_OK || e2 != ESP_OK) {
-        ESP_LOGE("BLK", "duty %lu failed (set=%d upd=%d)", (unsigned long)duty, (int)e1, (int)e2);
+    s_wake_brightness = percent;
+    backlight_raw_set(percent);
+}
+
+/* 唤醒屏幕：恢复用户亮度并重置空闲计时（触摸 / 闹钟 / 关闭熄屏开关共用） */
+static void screen_wake(void)
+{
+    s_last_touch_ms = lv_tick_get();
+    if (s_screen_sleeping) {
+        s_screen_sleeping = false;
+        backlight_set(s_wake_brightness);
+    }
+}
+
+/* 空闲熄屏轮询：30 秒无触摸则灭背光；唤醒由 screen_wake() 处理 */
+static void screen_sleep_poll(void)
+{
+    if (!g_sleep_enabled || s_screen_sleeping) return;
+    if (s_last_touch_ms && (lv_tick_get() - s_last_touch_ms) >= SCREEN_SLEEP_MS) {
+        s_screen_sleeping = true;
+        backlight_raw_set(0);
     }
 }
 
@@ -879,6 +997,14 @@ static void brightness_cb(lv_event_t *e)
     }
 }
 
+/* 自动熄屏开关 */
+static void sleep_cb(lv_event_t *e)
+{
+    lv_obj_t *sw = lv_event_get_target(e);
+    g_sleep_enabled = lv_obj_has_state(sw, LV_STATE_CHECKED);
+    screen_wake();
+}
+
 /* 音量滑块回调：audio_player 内部是软件数字增益(sample×vol/100)，
  * set_volume 通过命令队列下发到播放任务，从 LVGL 任务调用安全。 */
 static void volume_cb(lv_event_t *e)
@@ -896,17 +1022,155 @@ static void tts_auto_cb(lv_event_t *e)
     g_tts_auto = lv_obj_has_state(sw, LV_STATE_CHECKED);
 }
 
-/* USB 模拟U盘开关：只置 pending，实际切换在主循环做（SD 卡操作阻塞） */
+/* USB 模式互斥：U盘 / UAC 声卡 / CDC 调试口 / 网络共享四选一（共用 USB 口） */
 static void usb_msc_switch_cb(lv_event_t *e)
 {
     lv_obj_t *sw = lv_event_get_target(e);
     bool on = lv_obj_has_state(sw, LV_STATE_CHECKED);
     if (on && s_usb_msc_pending == 0) {
+        if (g_usb_uac_switch) lv_obj_clear_state(g_usb_uac_switch, LV_STATE_CHECKED);
+        if (g_usb_cdc_switch) lv_obj_clear_state(g_usb_cdc_switch, LV_STATE_CHECKED);
+        if (g_usb_ncm_switch) lv_obj_clear_state(g_usb_ncm_switch, LV_STATE_CHECKED);
+        s_usb_uac_pending = -1;
+        s_usb_cdc_pending = -1;
+        s_usb_ncm_pending = -1;
         s_usb_msc_pending = 1;
         if (g_usb_msc_label) lv_label_set_text(g_usb_msc_label, "正在切换U盘模式...");
     } else if (!on && s_usb_msc_pending == 0) {
         s_usb_msc_pending = -1;
         if (g_usb_msc_label) lv_label_set_text(g_usb_msc_label, "正在恢复SD卡...");
+    }
+}
+
+/* USB 声卡开关：只置 pending，实际切换在主循环做 */
+static void usb_uac_switch_cb(lv_event_t *e)
+{
+    lv_obj_t *sw = lv_event_get_target(e);
+    bool on = lv_obj_has_state(sw, LV_STATE_CHECKED);
+    if (on && s_usb_uac_pending == 0) {
+        if (g_usb_msc_switch) lv_obj_clear_state(g_usb_msc_switch, LV_STATE_CHECKED);
+        if (g_usb_cdc_switch) lv_obj_clear_state(g_usb_cdc_switch, LV_STATE_CHECKED);
+        if (g_usb_ncm_switch) lv_obj_clear_state(g_usb_ncm_switch, LV_STATE_CHECKED);
+        s_usb_msc_pending = -1;
+        s_usb_cdc_pending = -1;
+        s_usb_ncm_pending = -1;
+        s_usb_uac_pending = 1;
+        if (g_usb_uac_label) lv_label_set_text(g_usb_uac_label, "正在切换USB声卡...");
+    } else if (!on && s_usb_uac_pending == 0) {
+        s_usb_uac_pending = -1;
+        if (g_usb_uac_label) lv_label_set_text(g_usb_uac_label, "正在关闭USB声卡...");
+    }
+}
+
+/* USB CDC 调试口开关 */
+static void usb_cdc_switch_cb(lv_event_t *e)
+{
+    lv_obj_t *sw = lv_event_get_target(e);
+    bool on = lv_obj_has_state(sw, LV_STATE_CHECKED);
+    if (on && s_usb_cdc_pending == 0) {
+        if (g_usb_msc_switch) lv_obj_clear_state(g_usb_msc_switch, LV_STATE_CHECKED);
+        if (g_usb_uac_switch) lv_obj_clear_state(g_usb_uac_switch, LV_STATE_CHECKED);
+        if (g_usb_ncm_switch) lv_obj_clear_state(g_usb_ncm_switch, LV_STATE_CHECKED);
+        s_usb_msc_pending = -1;
+        s_usb_uac_pending = -1;
+        s_usb_ncm_pending = -1;
+        s_usb_cdc_pending = 1;
+        if (g_usb_cdc_label) lv_label_set_text(g_usb_cdc_label, "正在切换USB调试口...");
+    } else if (!on && s_usb_cdc_pending == 0) {
+        s_usb_cdc_pending = -1;
+        if (g_usb_cdc_label) lv_label_set_text(g_usb_cdc_label, "正在关闭USB调试口...");
+    }
+}
+
+/* USB 网络共享开关：只置 pending，实际切换在主循环做 */
+static void usb_ncm_switch_cb(lv_event_t *e)
+{
+    lv_obj_t *sw = lv_event_get_target(e);
+    bool on = lv_obj_has_state(sw, LV_STATE_CHECKED);
+    if (on && s_usb_ncm_pending == 0) {
+        if (g_usb_msc_switch) lv_obj_clear_state(g_usb_msc_switch, LV_STATE_CHECKED);
+        if (g_usb_uac_switch) lv_obj_clear_state(g_usb_uac_switch, LV_STATE_CHECKED);
+        if (g_usb_cdc_switch) lv_obj_clear_state(g_usb_cdc_switch, LV_STATE_CHECKED);
+        s_usb_msc_pending = -1;
+        s_usb_uac_pending = -1;
+        s_usb_cdc_pending = -1;
+        s_usb_ncm_pending = 1;
+        if (g_usb_ncm_label) lv_label_set_text(g_usb_ncm_label, "正在切换USB网络共享...");
+    } else if (!on && s_usb_ncm_pending == 0) {
+        s_usb_ncm_pending = -1;
+        if (g_usb_ncm_label) lv_label_set_text(g_usb_ncm_label, "正在关闭USB网络共享...");
+    }
+}
+
+/* 主循环调用：执行 NCM 切换 */
+static void usb_ncm_periodic(void)
+{
+    if (s_usb_ncm_pending == 0) return;
+    int cmd = s_usb_ncm_pending;
+    s_usb_ncm_pending = 0;
+
+    esp_err_t err;
+    if (cmd > 0) {
+        err = usb_ncm_start();
+        if (g_usb_ncm_label)
+            lv_label_set_text(g_usb_ncm_label,
+                err == ESP_OK ? "USB网络：电脑经ESP32的WiFi上网" : "启动失败：请先连WiFi，见串口日志");
+    } else {
+        err = usb_ncm_stop();
+        if (g_usb_ncm_label)
+            lv_label_set_text(g_usb_ncm_label, err == ESP_OK ? "USB网络：关闭" : "关闭失败");
+    }
+    if (g_usb_ncm_switch) {
+        if (usb_ncm_is_active()) lv_obj_add_state(g_usb_ncm_switch, LV_STATE_CHECKED);
+        else                    lv_obj_clear_state(g_usb_ncm_switch, LV_STATE_CHECKED);
+    }
+}
+
+/* 主循环调用：执行 CDC 调试口切换 */
+static void usb_cdc_periodic(void)
+{
+    if (s_usb_cdc_pending == 0) return;
+    int cmd = s_usb_cdc_pending;
+    s_usb_cdc_pending = 0;
+
+    esp_err_t err;
+    if (cmd > 0) {
+        err = usb_cdc_start();
+        if (g_usb_cdc_label)
+            lv_label_set_text(g_usb_cdc_label,
+                err == ESP_OK ? "USB调试口：电脑出现COM口，可收发" : "调试口启动失败，见串口日志");
+    } else {
+        err = usb_cdc_stop();
+        if (g_usb_cdc_label)
+            lv_label_set_text(g_usb_cdc_label, err == ESP_OK ? "USB调试口：关闭" : "关闭失败");
+    }
+    if (g_usb_cdc_switch) {
+        if (usb_cdc_is_active()) lv_obj_add_state(g_usb_cdc_switch, LV_STATE_CHECKED);
+        else                    lv_obj_clear_state(g_usb_cdc_switch, LV_STATE_CHECKED);
+    }
+}
+
+/* 主循环调用：执行 UAC 声卡切换 */
+static void usb_uac_periodic(void)
+{
+    if (s_usb_uac_pending == 0) return;
+    int cmd = s_usb_uac_pending;
+    s_usb_uac_pending = 0;
+
+    esp_err_t err;
+    if (cmd > 0) {
+        err = usb_uac_start();
+        if (g_usb_uac_label)
+            lv_label_set_text(g_usb_uac_label,
+                err == ESP_OK ? "USB声卡：电脑可见 喇叭+麦克风" : "声卡启动失败，见串口日志");
+    } else {
+        err = usb_uac_stop();
+        if (g_usb_uac_label)
+            lv_label_set_text(g_usb_uac_label, err == ESP_OK ? "USB声卡：关闭" : "关闭失败");
+    }
+    if (g_usb_uac_switch) {
+        if (usb_uac_is_active()) lv_obj_add_state(g_usb_uac_switch, LV_STATE_CHECKED);
+        else                    lv_obj_clear_state(g_usb_uac_switch, LV_STATE_CHECKED);
     }
 }
 
@@ -959,6 +1223,13 @@ static void settings_about_cb(lv_event_t *e)
 {
     (void)e;
     g_pending_app = APP_SYSINFO;
+}
+
+/* “系统诊断”行：打开环形日志缓冲查看页 */
+static void settings_log_cb(lv_event_t *e)
+{
+    (void)e;
+    g_pending_app = APP_LOG;
 }
 
 /* 设置界面：手机风格的设置列表（可滚动），亮度为其中一项 */
@@ -1023,6 +1294,39 @@ static void build_settings_screen(lv_obj_t *scr)
     lv_slider_set_value(sl, g_brightness, LV_ANIM_OFF);
     lv_obj_set_scrollbar_mode(sl, LV_SCROLLBAR_MODE_OFF);
     lv_obj_add_event_cb(sl, brightness_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    /* ---------- 自动熄屏 ---------- */
+    lv_obj_t *sleeprow = lv_obj_create(list);
+    lv_obj_set_width(sleeprow, LV_PCT(100));
+    lv_obj_set_height(sleeprow, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(sleeprow, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_opa(sleeprow, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_radius(sleeprow, 0, 0);
+    lv_obj_set_style_pad_hor(sleeprow, 14, 0);
+    lv_obj_set_style_pad_top(sleeprow, 14, 0);
+    lv_obj_set_style_pad_bottom(sleeprow, 14, 0);
+    lv_obj_set_flex_flow(sleeprow, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(sleeprow, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(sleeprow, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(sleeprow, LV_SCROLLBAR_MODE_OFF);
+
+    lv_obj_t *slp = lv_label_create(sleeprow);
+    lv_label_set_text(slp, "自动熄屏");
+    lv_obj_set_style_text_font(slp, &lv_font_cn_16, 0);
+    lv_obj_set_style_text_color(slp, lv_color_white(), 0);
+    lv_obj_clear_flag(slp, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t *slpsw = lv_switch_create(sleeprow);
+    if (g_sleep_enabled) lv_obj_add_state(slpsw, LV_STATE_CHECKED);
+    lv_obj_add_event_cb(slpsw, sleep_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    lv_obj_t *slphint = lv_label_create(list);
+    lv_obj_set_width(slphint, LV_PCT(100));
+    lv_label_set_text(slphint, "30 秒无触摸自动熄屏，任意触摸唤醒");
+    lv_obj_set_style_text_font(slphint, &lv_font_cn_16, 0);
+    lv_obj_set_style_text_color(slphint, lv_color_hex(0x9AA0B5), 0);
+    lv_obj_set_style_pad_left(slphint, 14, 0);
+    lv_obj_clear_flag(slphint, LV_OBJ_FLAG_CLICKABLE);
 
     settings_add_separator(list);
 
@@ -1134,6 +1438,105 @@ static void build_settings_screen(lv_obj_t *scr)
     lv_obj_set_style_pad_left(g_usb_msc_label, 14, 0);
     lv_obj_clear_flag(g_usb_msc_label, LV_OBJ_FLAG_CLICKABLE);
 
+    /* ---------- USB 声卡（UAC）：与 U盘二选一 ---------- */
+    lv_obj_t *uacrow = lv_obj_create(list);
+    lv_obj_set_width(uacrow, LV_PCT(100));
+    lv_obj_set_height(uacrow, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(uacrow, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_opa(uacrow, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_radius(uacrow, 0, 0);
+    lv_obj_set_style_pad_hor(uacrow, 14, 0);
+    lv_obj_set_style_pad_top(uacrow, 14, 0);
+    lv_obj_set_style_pad_bottom(uacrow, 14, 0);
+    lv_obj_set_flex_flow(uacrow, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(uacrow, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(uacrow, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(uacrow, LV_SCROLLBAR_MODE_OFF);
+
+    lv_obj_t *uacl = lv_label_create(uacrow);
+    lv_label_set_text(uacl, "USB声卡(免驱)");
+    lv_obj_set_style_text_font(uacl, &lv_font_cn_16, 0);
+    lv_obj_set_style_text_color(uacl, lv_color_white(), 0);
+    lv_obj_clear_flag(uacl, LV_OBJ_FLAG_CLICKABLE);
+
+    g_usb_uac_switch = lv_switch_create(uacrow);
+    lv_obj_clear_state(g_usb_uac_switch, LV_STATE_CHECKED);   /* 默认关 */
+    lv_obj_add_event_cb(g_usb_uac_switch, usb_uac_switch_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    g_usb_uac_label = lv_label_create(list);
+    lv_obj_set_width(g_usb_uac_label, LV_PCT(100));
+    lv_label_set_text(g_usb_uac_label, "开启后电脑把ESP32当麦克风+喇叭，音乐/录音暂停");
+    lv_obj_set_style_text_font(g_usb_uac_label, &lv_font_cn_16, 0);
+    lv_obj_set_style_text_color(g_usb_uac_label, lv_color_hex(0x9AA0B5), 0);
+    lv_obj_set_style_pad_left(g_usb_uac_label, 14, 0);
+    lv_obj_clear_flag(g_usb_uac_label, LV_OBJ_FLAG_CLICKABLE);
+
+    /* ---------- USB CDC 调试串口 ---------- */
+    lv_obj_t *cdcrow = lv_obj_create(list);
+    lv_obj_set_width(cdcrow, LV_PCT(100));
+    lv_obj_set_height(cdcrow, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(cdcrow, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_opa(cdcrow, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_radius(cdcrow, 0, 0);
+    lv_obj_set_style_pad_hor(cdcrow, 14, 0);
+    lv_obj_set_style_pad_top(cdcrow, 14, 0);
+    lv_obj_set_style_pad_bottom(cdcrow, 14, 0);
+    lv_obj_set_flex_flow(cdcrow, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(cdcrow, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(cdcrow, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(cdcrow, LV_SCROLLBAR_MODE_OFF);
+
+    lv_obj_t *cdcl = lv_label_create(cdcrow);
+    lv_label_set_text(cdcl, "USB调试串口");
+    lv_obj_set_style_text_font(cdcl, &lv_font_cn_16, 0);
+    lv_obj_set_style_text_color(cdcl, lv_color_white(), 0);
+    lv_obj_clear_flag(cdcl, LV_OBJ_FLAG_CLICKABLE);
+
+    g_usb_cdc_switch = lv_switch_create(cdcrow);
+    lv_obj_clear_state(g_usb_cdc_switch, LV_STATE_CHECKED);   /* 默认关 */
+    lv_obj_add_event_cb(g_usb_cdc_switch, usb_cdc_switch_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    g_usb_cdc_label = lv_label_create(list);
+    lv_obj_set_width(g_usb_cdc_label, LV_PCT(100));
+    lv_label_set_text(g_usb_cdc_label, "开启后电脑出现COM口，可收发文本/查看状态");
+    lv_obj_set_style_text_font(g_usb_cdc_label, &lv_font_cn_16, 0);
+    lv_obj_set_style_text_color(g_usb_cdc_label, lv_color_hex(0x9AA0B5), 0);
+    lv_obj_set_style_pad_left(g_usb_cdc_label, 14, 0);
+    lv_obj_clear_flag(g_usb_cdc_label, LV_OBJ_FLAG_CLICKABLE);
+
+    /* ---------- USB 网络共享（NCM） ---------- */
+    lv_obj_t *ncmrow = lv_obj_create(list);
+    lv_obj_set_width(ncmrow, LV_PCT(100));
+    lv_obj_set_height(ncmrow, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(ncmrow, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_opa(ncmrow, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_radius(ncmrow, 0, 0);
+    lv_obj_set_style_pad_hor(ncmrow, 14, 0);
+    lv_obj_set_style_pad_top(ncmrow, 14, 0);
+    lv_obj_set_style_pad_bottom(ncmrow, 14, 0);
+    lv_obj_set_flex_flow(ncmrow, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(ncmrow, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(ncmrow, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(ncmrow, LV_SCROLLBAR_MODE_OFF);
+
+    lv_obj_t *ncml = lv_label_create(ncmrow);
+    lv_label_set_text(ncml, "USB网络共享");
+    lv_obj_set_style_text_font(ncml, &lv_font_cn_16, 0);
+    lv_obj_set_style_text_color(ncml, lv_color_white(), 0);
+    lv_obj_clear_flag(ncml, LV_OBJ_FLAG_CLICKABLE);
+
+    g_usb_ncm_switch = lv_switch_create(ncmrow);
+    lv_obj_clear_state(g_usb_ncm_switch, LV_STATE_CHECKED);   /* 默认关 */
+    lv_obj_add_event_cb(g_usb_ncm_switch, usb_ncm_switch_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    g_usb_ncm_label = lv_label_create(list);
+    lv_obj_set_width(g_usb_ncm_label, LV_PCT(100));
+    lv_label_set_text(g_usb_ncm_label, "需先连WiFi；开启后电脑经USB共享网络");
+    lv_obj_set_style_text_font(g_usb_ncm_label, &lv_font_cn_16, 0);
+    lv_obj_set_style_text_color(g_usb_ncm_label, lv_color_hex(0x9AA0B5), 0);
+    lv_obj_set_style_pad_left(g_usb_ncm_label, 14, 0);
+    lv_obj_clear_flag(g_usb_ncm_label, LV_OBJ_FLAG_CLICKABLE);
+
     settings_add_separator(list);
 
     /* ---------- AI 聊天 Key / 平台 ---------- */
@@ -1162,6 +1565,35 @@ static void build_settings_screen(lv_obj_t *scr)
     lv_label_set_text(aichev, LV_SYMBOL_RIGHT);
     lv_obj_set_style_text_color(aichev, lv_color_hex(0x9AA0B5), 0);
     lv_obj_clear_flag(aichev, LV_OBJ_FLAG_CLICKABLE);
+
+    settings_add_separator(list);
+
+    /* ---------- 系统诊断 ---------- */
+    lv_obj_t *logrow = lv_obj_create(list);
+    lv_obj_set_width(logrow, LV_PCT(100));
+    lv_obj_set_height(logrow, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(logrow, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_opa(logrow, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_radius(logrow, 0, 0);
+    lv_obj_set_style_pad_hor(logrow, 14, 0);
+    lv_obj_set_style_pad_top(logrow, 14, 0);
+    lv_obj_set_style_pad_bottom(logrow, 14, 0);
+    lv_obj_set_flex_flow(logrow, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(logrow, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(logrow, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(logrow, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_add_event_cb(logrow, settings_log_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *lt = lv_label_create(logrow);
+    lv_label_set_text(lt, "系统诊断");
+    lv_obj_set_style_text_font(lt, &lv_font_cn_16, 0);
+    lv_obj_set_style_text_color(lt, lv_color_white(), 0);
+    lv_obj_clear_flag(lt, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t *lchev = lv_label_create(logrow);
+    lv_label_set_text(lchev, LV_SYMBOL_RIGHT);
+    lv_obj_set_style_text_color(lchev, lv_color_hex(0x9AA0B5), 0);
+    lv_obj_clear_flag(lchev, LV_OBJ_FLAG_CLICKABLE);
 
     settings_add_separator(list);
 
@@ -1452,8 +1884,9 @@ static void build_wifi_screen(lv_obj_t *scr)
     lv_obj_set_style_border_opa(spacer, LV_OPA_TRANSP, 0);
     lv_obj_set_flex_grow(spacer, 1);
     lv_obj_t *sw = lv_switch_create(header);
-    lv_obj_add_state(sw, LV_STATE_CHECKED);
+    if (g_wifi_on) lv_obj_add_state(sw, LV_STATE_CHECKED);
     lv_obj_add_event_cb(sw, switch_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    g_wifi_page_switch = sw;
 
     /* 副标题（网络数量 / 状态） */
     g_subtitle = lv_label_create(scr);
@@ -1607,25 +2040,7 @@ static void build_wifi_screen(lv_obj_t *scr)
 
 /* ---------------- BLE (蓝牙) 界面 ---------------- */
 
-static bool g_ble_on = true;
-static lv_obj_t *g_ble_subtitle = NULL;
 static lv_obj_t *g_ble_list_cont = NULL;
-
-/* BLE 开关：开 -> 触发扫描；关 -> 清空列表 */
-static void ble_switch_cb(lv_event_t *e)
-{
-    lv_obj_t *sw = lv_event_get_target(e);
-    g_ble_on = lv_obj_has_state(sw, LV_STATE_CHECKED);
-    if (g_ble_on) {
-        ble_scan_trigger();
-        if (g_ble_subtitle) lv_label_set_text(g_ble_subtitle, "扫描中...");
-    } else {
-        if (g_ble_subtitle) lv_label_set_text(g_ble_subtitle, "蓝牙已关闭");
-        for (int i = 0; i < BLE_LIST_ROWS; i++) {
-            lv_obj_add_flag(g_ble_rows[i].row, LV_OBJ_FLAG_HIDDEN);
-        }
-    }
-}
 
 /* 点击某个 BLE 设备：打开详情页 */
 static void ble_item_cb(lv_event_t *e)
@@ -1721,12 +2136,13 @@ static void build_ble_screen(lv_obj_t *scr)
     lv_obj_set_style_border_opa(spacer, LV_OPA_TRANSP, 0);
     lv_obj_set_flex_grow(spacer, 1);
     lv_obj_t *sw = lv_switch_create(header);
-    lv_obj_add_state(sw, LV_STATE_CHECKED);
+    if (g_ble_on) lv_obj_add_state(sw, LV_STATE_CHECKED);
     lv_obj_add_event_cb(sw, ble_switch_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    g_ble_page_switch = sw;
 
     /* 副标题 */
     g_ble_subtitle = lv_label_create(scr);
-    lv_label_set_text(g_ble_subtitle, "扫描中...");
+    lv_label_set_text(g_ble_subtitle, "蓝牙已关闭，请打开上方开关");
     lv_obj_set_style_text_font(g_ble_subtitle, &lv_font_cn_16, 0);
     lv_obj_set_style_text_color(g_ble_subtitle, lv_color_hex(0x9AA0B5), 0);
     lv_obj_align(g_ble_subtitle, LV_ALIGN_TOP_LEFT, 14, 70);
@@ -4241,6 +4657,7 @@ static void lvgl_home_setup(void)
 static lv_obj_t *g_fps_label   = NULL;
 static uint32_t  g_fps_frames  = 0;
 static uint32_t  g_fps_last_ms = 0;
+static uint32_t  s_fps_value   = 0;   /* 供系统诊断页显示 */
 
 static void lvgl_fps_setup(void)
 {
@@ -4273,27 +4690,28 @@ static void ui_fps_update(void)
     uint32_t cur  = g_flush_cnt;
     uint32_t diff = cur - g_fps_frames;   /* g_fps_frames 复用作"上次计数" */
     uint32_t fps  = (uint32_t)((uint64_t)diff * 1000U / dt);
+    s_fps_value = fps;
     lv_label_set_text_fmt(g_fps_label, "%u fps", (unsigned)fps);
     g_fps_frames  = cur;   /* 保存当前计数, 下次差值用 */
     g_fps_last_ms = now;
 }
 
 static void ui_alarm_popup_create(void);  /* 前置声明：定义在文件后部 */
+
 /* LVGL 启动初始化：端口、背光、触摸、WiFi、天气后台任务、主界面与触摸红点 */
 static void lvgl_ui_bootstrap(void)
 {
     lvgl_port_init();                       /* LVGL 显示端口 */
     backlight_init();                       /* 背光 PWM */
     backlight_set(g_brightness);            /* 默认全亮 */
+    s_last_touch_ms = lv_tick_get();        /* 开机后重新计空闲时间 */
     lvgl_touch_setup();                     /* 触摸输入 */
     weather_init();                         /* 天气后台任务：栈用 PSRAM，不占内部 RAM，避免和 draw_buf 互挤 */
     pc_mon_init();                          /* 电脑监控后台任务 */
     /* 闹钟：从 NVS 载入上次设置。必须排在 wifi_scan_init() 之后，
      * 因为 nvs_flash_init() 是由它内部完成的 */
     alarm_init();
-    if (ble_scan_init() != ESP_OK) {          /* BLE 扫描后台任务 */
-        ESP_LOGE("BLE", "ble scan init failed");
-    }
+    /* BLE 默认不初始化：进入蓝牙 App 或设置页开关打开时才 ble_scan_init() */
     lvgl_home_setup();                      /* 主界面 + 触摸红点 */
     make_status_bar(lv_layer_top());        /* 状态栏统一挂在顶层 layer，不随任何 screen 滚动/切换 */
     lvgl_fps_setup();                       /* 诊断：FPS 显示 */
@@ -4440,7 +4858,10 @@ static void ui_alarm_refresh(void)
             snprintf(nbuf, sizeof(nbuf), "闹钟 %d", idx + 1);
             lv_label_set_text(g_alarm_popup_title, nbuf);
         }
-        if (g_alarm_popup) lv_obj_clear_flag(g_alarm_popup, LV_OBJ_FLAG_HIDDEN);
+        if (g_alarm_popup) {
+            lv_obj_clear_flag(g_alarm_popup, LV_OBJ_FLAG_HIDDEN);
+            screen_wake();   /* 闹钟触发时自动点亮，否则看不见弹窗 */
+        }
     }
 
     /* 弹窗可见时每秒切换一次边框颜色，形成闪烁 */
@@ -4654,7 +5075,8 @@ static void sysinfo_timer_cb(lv_timer_t *t)
     lv_label_set_text_fmt(g_sysinfo_labels[6],  "SDK:         %s", esp_get_idf_version());
     lv_label_set_text_fmt(g_sysinfo_labels[7],  "MAC:         %02X:%02X:%02X:%02X:%02X:%02X",
                           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-    lv_label_set_text_fmt(g_sysinfo_labels[8],  "WiFi:        %s", g_wifi_on ? "已连接" : "未连接");
+    lv_label_set_text_fmt(g_sysinfo_labels[8],  "WiFi:        %s",
+                          g_wifi_state == WIFI_STA_CONNECTED ? "已连接" : "未连接");
 #ifdef SYSINFO_HAS_TEMP
     if (s_ts) {
         float tp = 0;
@@ -4973,6 +5395,165 @@ static void build_timer_screen(lv_obj_t *parent)
     tm_set_mode(0);
 }
 
+/* ---------------- 系统诊断页 ---------------- */
+
+static void build_log_screen(lv_obj_t *parent)
+{
+    /* 系统诊断页：每行一个 label，颜色既可分组，也可按状态动态变化。
+     * 不依赖 LVGL recolor 标记，避免中文/折行时颜色解析混乱。 */
+    s_log_font = lv_font_montserrat_14;
+    s_log_font.fallback = &lv_font_cn_16;
+
+    static const uint32_t initial_colors[DIAG_LABEL_COUNT] = {
+        0x9AA0B5, 0x9AA0B5, 0x5AB0FF, 0xC8CDD8, 0xC8CDD8, 0xC8CDD8,
+        0x5AB0FF, 0x5AB0FF, 0xC8CDD8, 0x9AA0B5, 0xC8CDD8,
+    };
+    static const char *initial_text[DIAG_LABEL_COUNT] = {
+        "运行时长 --分--秒   帧率 --",
+        "复位原因 --   任务数 --",
+        "内存状态",
+        "内部RAM 空闲 --KB",
+        "内部RAM 历史最低 --KB",
+        "内部RAM 最大空闲块 --KB",
+        "PSRAM 空闲 --KB / 最大空闲块 --KB",
+        "网络状态",
+        "WiFi 状态 --",
+        "USB 模式 --",
+        "SD卡状态 --",
+    };
+
+    for (int i = 0; i < DIAG_LABEL_COUNT; i++) {
+        lv_obj_t *lab = lv_label_create(parent);
+        lv_obj_set_width(lab, LCD_W - 20);
+        lv_obj_align(lab, LV_ALIGN_TOP_LEFT, 10, 68 + i * 15);
+        lv_obj_set_style_text_font(lab, &s_log_font, 0);
+        lv_obj_set_style_text_color(lab, lv_color_hex(initial_colors[i]), 0);
+        lv_obj_set_style_text_align(lab, LV_TEXT_ALIGN_LEFT, 0);
+        lv_label_set_long_mode(lab, LV_LABEL_LONG_MODE_DOTS);
+        lv_label_set_text(lab, initial_text[i]);
+        lv_obj_clear_flag(lab, LV_OBJ_FLAG_CLICKABLE);
+        g_diag_labels[i] = lab;
+    }
+    g_log_label = g_diag_labels[0];
+}
+
+static const char *diag_reset_reason(void)
+{
+    switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:   return "上电";
+    case ESP_RST_EXT:       return "外部引脚";
+    case ESP_RST_SW:        return "软件重启";
+    case ESP_RST_PANIC:     return "异常崩溃";
+    case ESP_RST_INT_WDT:   return "中断看门狗";
+    case ESP_RST_TASK_WDT:  return "任务看门狗";
+    case ESP_RST_WDT:       return "其他看门狗";
+    case ESP_RST_DEEPSLEEP: return "深度睡眠唤醒";
+    case ESP_RST_BROWNOUT:  return "欠压";
+    case ESP_RST_SDIO:      return "SDIO";
+    case ESP_RST_USB:       return "USB";
+    case ESP_RST_JTAG:      return "JTAG";
+    case ESP_RST_CPU_LOCKUP:return "CPU锁死";
+    default:                return "未知";
+    }
+}
+
+static bool diag_reset_is_abnormal(void)
+{
+    esp_reset_reason_t r = esp_reset_reason();
+    return r == ESP_RST_PANIC || r == ESP_RST_INT_WDT || r == ESP_RST_TASK_WDT ||
+           r == ESP_RST_WDT || r == ESP_RST_BROWNOUT || r == ESP_RST_CPU_LOCKUP;
+}
+
+static void ui_log_screen_refresh(void)
+{
+    if (g_active_app != APP_LOG || !g_log_label) return;
+    static uint32_t s_last_ms = 0;
+    uint32_t now = lv_tick_get();
+    if (now - s_last_ms < 1000) return;
+    s_last_ms = now;
+
+    unsigned uptime_s = (unsigned)(now / 1000);
+    unsigned int_kb   = (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024);
+    unsigned int_min  = (unsigned)(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL) / 1024);
+    unsigned int_blk  = (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024);
+    unsigned ps_kb    = (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024);
+    unsigned ps_blk   = (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024);
+    unsigned tasks    = (unsigned)uxTaskGetNumberOfTasks();
+
+    char wifi_info[64];
+    uint32_t wifi_color;
+    if (g_wifi_state == WIFI_STA_CONNECTED) {
+        snprintf(wifi_info, sizeof(wifi_info), "已连接 %s",
+                 g_wifi_ip[0] ? g_wifi_ip : "(无IP)");
+        wifi_color = 0x6EE7B7;
+    } else if (g_wifi_state == WIFI_STA_CONNECTING) {
+        snprintf(wifi_info, sizeof(wifi_info), "连接中 %s", g_wifi_ssid);
+        wifi_color = 0xF0A742;
+    } else if (g_wifi_state == WIFI_STA_FAILED) {
+        snprintf(wifi_info, sizeof(wifi_info), "连接失败 %s", g_wifi_ssid);
+        wifi_color = 0xFF6B6B;
+    } else {
+        snprintf(wifi_info, sizeof(wifi_info), "未连接");
+        wifi_color = 0x9AA0B5;
+    }
+
+    const char *usb = "未启用";
+    bool usb_active = false;
+    if (usb_ncm_is_active()) {      usb = "NCM 网络"; usb_active = true; }
+    else if (usb_cdc_is_active()) { usb = "CDC 调试"; usb_active = true; }
+    else if (usb_msc_is_active()) { usb = "模拟U盘"; usb_active = true; }
+    else if (usb_uac_is_active()) { usb = "USB 声卡"; usb_active = true; }
+
+    char sd_info[64];
+    uint32_t sd_color;
+    if (g_sdcard.mounted) {
+        /* 频率按 0.1MHz / 0.1MB/s 显示，避免浮点格式化开销。 */
+        unsigned mhz10  = (unsigned)g_sdcard.freq_khz / 100;
+        unsigned mbps10 = (unsigned)((uint32_t)g_sdcard.freq_khz * (uint32_t)g_sdcard.width / 800);
+        snprintf(sd_info, sizeof(sd_info), "%d线 %u.%uMHz 理论带宽 %u.%uMB/s",
+                 g_sdcard.width, mhz10 / 10, mhz10 % 10, mbps10 / 10, mbps10 % 10);
+        sd_color = 0x6EE7B7;
+    } else {
+        snprintf(sd_info, sizeof(sd_info), "未挂载");
+        sd_color = 0xF0A742;
+    }
+
+    uint32_t reset_color = diag_reset_is_abnormal() ? 0xFF6B6B : 0x9AA0B5;
+    uint32_t mem_color = (int_min < 32 || int_blk < 12) ? 0xFF6B6B :
+                         (int_min < 64 ? 0xF0A742 : 0x6EE7B7);
+    uint32_t ps_color  = (ps_kb < 512 || ps_blk < 256) ? 0xF0A742 : 0x6EE7B7;
+
+    lv_obj_set_style_text_color(g_diag_labels[0], lv_color_hex(0x9AA0B5), 0);
+    lv_label_set_text_fmt(g_diag_labels[0], "运行时长 %u分%02u秒   帧率 %u",
+                          uptime_s / 60, uptime_s % 60, (unsigned)s_fps_value);
+
+    lv_obj_set_style_text_color(g_diag_labels[1], lv_color_hex(reset_color), 0);
+    lv_label_set_text_fmt(g_diag_labels[1], "复位原因 %s   任务数 %u",
+                          diag_reset_reason(), tasks);
+
+    lv_obj_set_style_text_color(g_diag_labels[3], lv_color_hex(mem_color), 0);
+    lv_label_set_text_fmt(g_diag_labels[3], "内部RAM 空闲 %uKB", int_kb);
+
+    lv_obj_set_style_text_color(g_diag_labels[4], lv_color_hex(mem_color), 0);
+    lv_label_set_text_fmt(g_diag_labels[4], "内部RAM 历史最低 %uKB", int_min);
+
+    lv_obj_set_style_text_color(g_diag_labels[5], lv_color_hex(mem_color), 0);
+    lv_label_set_text_fmt(g_diag_labels[5], "内部RAM 最大空闲块 %uKB", int_blk);
+
+    lv_obj_set_style_text_color(g_diag_labels[6], lv_color_hex(ps_color), 0);
+    lv_label_set_text_fmt(g_diag_labels[6], "PSRAM 空闲 %uKB / 最大空闲块 %uKB",
+                          ps_kb, ps_blk);
+
+    lv_obj_set_style_text_color(g_diag_labels[8], lv_color_hex(wifi_color), 0);
+    lv_label_set_text_fmt(g_diag_labels[8], "WiFi 状态 %s", wifi_info);
+
+    lv_obj_set_style_text_color(g_diag_labels[9], lv_color_hex(usb_active ? 0x5AB0FF : 0x9AA0B5), 0);
+    lv_label_set_text_fmt(g_diag_labels[9], "USB 模式 %s", usb);
+
+    lv_obj_set_style_text_color(g_diag_labels[10], lv_color_hex(sd_color), 0);
+    lv_label_set_text_fmt(g_diag_labels[10], "SD卡状态 %s", sd_info);
+}
+
 #if UI_MEM_DEBUG
 static const char *app_id_name(int id)
 {
@@ -4991,6 +5572,7 @@ static const char *app_id_name(int id)
     case APP_SYSINFO:  return "系统";
     case APP_TIMER:    return "计时器";
     case APP_AI_CHAT:  return "AI聊天";
+    case APP_LOG:      return "系统诊断";
     default:           return "?";
     }
 }
@@ -5152,6 +5734,13 @@ static void ui_handle_pending_app(void)
         s_ai_shown_ver = g_ai.version;   /* 进屏时对齐，避免补一屏旧回复 */
         scr = g_ai_screen;
         break;
+    case APP_LOG:
+        if (!g_log_screen) {
+            g_log_screen = make_app_screen("系统诊断");
+            build_log_screen(g_log_screen);
+        }
+        scr = g_log_screen;
+        break;
     default:
         break;
     }
@@ -5159,8 +5748,10 @@ static void ui_handle_pending_app(void)
         if (id == APP_WIFI && g_wifi_on) {
             wifi_scan_trigger();
         }
-        if (id == APP_BLE && g_ble_on) {
-            ble_scan_trigger();
+        if (id == APP_BLE) {
+            /* 蓝牙默认关：进蓝牙 App 时才初始化 NimBLE 并扫描 */
+            if (!g_ble_on) apply_ble_switch(true);
+            else           ble_scan_trigger();
         }
         if (id == APP_FILES) {
             file_mgr_on_open();   /* 请求挂载 SD 卡并列出根目录（真正干活在主循环） */
@@ -5391,6 +5982,9 @@ static void lvgl_task(void *arg)
         ui_pcmon_screen_refresh();    /* 内部已按活动屏保护 */
         file_mgr_periodic();          /* 文件命令队列，可能屏外触发，不门控 */
         usb_msc_periodic();           /* USB 模拟U盘：执行延迟的 start/stop 切换 */
+        usb_uac_periodic();           /* USB 声卡：执行延迟的 start/stop 切换 */
+        usb_cdc_periodic();           /* USB CDC 调试口：执行延迟的 start/stop 切换 */
+        usb_ncm_periodic();           /* USB 网络共享：执行延迟的 start/stop 切换 */
 
         /* 下面这些刷新只服务于各自专属屏，按当前活动 App 门控，避免每帧空跑 */
         if (g_active_app == APP_CLOCK) ui_clock_refresh();
@@ -5409,6 +6003,8 @@ static void lvgl_task(void *arg)
         if (opened_app >= 0) ui_mem_dump("app");  /* 建屏后立刻打印，看单个 App 吃掉多少 */
 #endif
         // ui_refresh_touch_dot();           /* 触摸红点不再使用（INT 中断后无需可视化调试） */
+        ui_log_screen_refresh();              /* 系统诊断页：内部按 APP_LOG 门控 */
+        screen_sleep_poll();                  /* 30 秒无触摸熄屏，触摸唤醒 */
 
 #if UI_MEM_DEBUG
         /* 诊断：每 5 秒打印一次 LV_MEM 占用 */

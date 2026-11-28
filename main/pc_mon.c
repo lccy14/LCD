@@ -1,6 +1,7 @@
 #include "pc_mon.h"
 #include "wifi_scan.h"      /* g_wifi_state */
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "lwip/sockets.h"
@@ -225,6 +226,12 @@ static void pc_mon_task(void *arg)
 
 void pc_mon_init(void)
 {
-    /* 保存任务句柄：pc_mon_set_active 靠它把任务从阻塞中唤醒 */
-    xTaskCreate(pc_mon_task, "pc_mon", 8192, NULL, 3, &s_task);
+    /* 保存任务句柄：pc_mon_set_active 靠它把任务从阻塞中唤醒。
+     * 栈放 PSRAM 省内部 RAM；网络任务不涉及 flash cache 禁用期访问栈。 */
+    BaseType_t ok = xTaskCreateWithCaps(pc_mon_task, "pc_mon", 8192, NULL, 3,
+                                        &s_task, MALLOC_CAP_SPIRAM);
+    if (ok != pdPASS) {
+        ESP_LOGW(TAG, "PSRAM 栈分配失败，回退内部 RAM");
+        xTaskCreate(pc_mon_task, "pc_mon", 8192, NULL, 3, &s_task);
+    }
 }

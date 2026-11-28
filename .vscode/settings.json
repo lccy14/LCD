@@ -15,5 +15,5 @@
     "--compile-commands-dir=c:\\esp32\\LCD\\build"
   ],
   "idf.flashType": "UART",
-  "idf.port": "COM94"
+  "idf.port": "COM95"
 }

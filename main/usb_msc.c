@@ -12,6 +12,9 @@
 #include "audio_player.h"
 #include "mic_rec.h"
 #include "voice_tts.h"
+#include "usb_uac.h"
+#include "usb_cdc.h"
+#include "usb_ncm.h"
 
 static const char *TAG = "USB_MSC";
 
@@ -27,6 +30,31 @@ static const char *s_usb_strings[] = {
     NULL,                   /* 3: Serial（运行时由 eFuse MAC 填充） */
     "Mass Storage",         /* 4: MSC/CDC 接口（占位，兼容两种 STRID 布局） */
     "Mass Storage",         /* 5: MSC 接口 */
+};
+
+/* 纯 MSC 描述符：必须显式传，否则 esp_tinyusb 会用编译期默认描述符。
+ * 开了 CDC/NCM/AUDIO 后默认描述符变成复合设备（含 NCM 接口），U盘模式下
+ * NCM driver 没初始化，主机枚举时 netd_open/dfifo_alloc 会 ASSERT FAILED。 */
+#define MSC_CFG_TOTAL_LEN (TUD_CONFIG_DESC_LEN + TUD_MSC_DESC_LEN)
+static const tusb_desc_device_t s_msc_dev_desc = {
+    .bLength            = sizeof(tusb_desc_device_t),
+    .bDescriptorType    = TUSB_DESC_DEVICE,
+    .bcdUSB             = 0x0200,
+    .bDeviceClass       = 0x00,   /* 纯 MSC：class 在接口层声明 */
+    .bDeviceSubClass    = 0x00,
+    .bDeviceProtocol    = 0x00,
+    .bMaxPacketSize0    = CFG_TUD_ENDPOINT0_SIZE,
+    .idVendor           = 0x303A,
+    .idProduct          = 0x8001,
+    .bcdDevice          = 0x0100,
+    .iManufacturer      = 0x01,
+    .iProduct           = 0x02,
+    .iSerialNumber      = 0x03,
+    .bNumConfigurations = 0x01,
+};
+static const uint8_t s_msc_cfg_desc[] = {
+    TUD_CONFIG_DESCRIPTOR(1, 1, 0, MSC_CFG_TOTAL_LEN, 0x00, 100),
+    TUD_MSC_DESCRIPTOR(0, 5, 0x01, 0x81, 64),
 };
 
 static usb_msc_state_t s_state = USB_MSC_IDLE;
@@ -94,6 +122,11 @@ esp_err_t usb_msc_start(void)
     s_state = USB_MSC_STARTING;
     esp_err_t err;
 
+    /* 0. 与 UAC 声卡 / CDC / 网络共享互斥：先卸载释放 USB */
+    usb_uac_stop();
+    usb_cdc_stop();
+    usb_ncm_stop();
+
     /* 1. 停掉所有会访问 SD 卡的任务 */
     audio_player_stop();
     mic_rec_stop();
@@ -138,10 +171,13 @@ esp_err_t usb_msc_start(void)
     }
 
     /* 6. 安装 USB device driver（full-speed OTG，默认 PHY）
-     * 显式给字符串描述符，绕开 esp_tinyusb 默认描述符数量超限的 bug */
+     * 显式传纯 MSC 描述符：开了 NCM/CDC/AUDIO 后默认描述符是复合设备，
+     * 会导致未初始化的 class（如 NCM）在枚举时 open 端点失败。 */
     s_tusb_cfg = TINYUSB_DEFAULT_CONFIG(usb_device_event_cb, NULL);
+    s_tusb_cfg.descriptor.device = &s_msc_dev_desc;
     s_tusb_cfg.descriptor.string = s_usb_strings;
     s_tusb_cfg.descriptor.string_count = sizeof(s_usb_strings) / sizeof(s_usb_strings[0]);
+    s_tusb_cfg.descriptor.full_speed_config = s_msc_cfg_desc;
     err = tinyusb_driver_install(&s_tusb_cfg);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "tinyusb driver install failed: %s", esp_err_to_name(err));
@@ -176,8 +212,8 @@ fail_raw:
 esp_err_t usb_msc_stop(void)
 {
     if (s_state != USB_MSC_ACTIVE) {
-        ESP_LOGW(TAG, "状态非 ACTIVE(%d)，忽略 stop", s_state);
-        return ESP_ERR_INVALID_STATE;
+        /* 四选一切换时，每个新模式 start 都会调本函数；静默返回避免日志刷屏 */
+        return ESP_OK;
     }
     s_state = USB_MSC_STOPPING;
 

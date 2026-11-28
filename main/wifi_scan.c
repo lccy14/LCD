@@ -3,6 +3,7 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "esp_heap_caps.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "time_sync.h"   /* 连上网后自动校时 */
@@ -18,6 +19,7 @@ int       g_ap_count = 0;
 bool      g_ap_updated = false;
 
 static SemaphoreHandle_t s_scan_sem = NULL;
+static bool s_wifi_enabled = true;   /* 开机默认开启 WiFi STA */
 
 /* ---------------- STA 连接相关 ---------------- */
 #define NVS_NS_WIFI   "wificfg"
@@ -266,9 +268,47 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
 
 void wifi_scan_trigger(void)
 {
+    if (!s_wifi_enabled) return;
     if (s_scan_sem) {
         xSemaphoreGive(s_scan_sem);
     }
+}
+
+esp_err_t wifi_set_enabled(bool enable)
+{
+    if (s_wifi_enabled == enable) return ESP_OK;
+
+    if (!enable) {
+        s_wifi_enabled = false;
+        s_manual_disconnect = true;
+        esp_wifi_disconnect();
+        esp_err_t err = esp_wifi_stop();
+        g_wifi_state = WIFI_STA_IDLE;
+        g_wifi_ssid[0] = '\0';
+        g_wifi_ip[0] = '\0';
+        g_ap_count = 0;
+        g_ap_updated = false;
+        ESP_LOGI(TAG, "WiFi disabled");
+        return err;
+    }
+
+    s_wifi_enabled = true;
+    esp_err_t err = esp_wifi_start();
+    if (err != ESP_OK) {
+        s_wifi_enabled = false;
+        ESP_LOGE(TAG, "esp_wifi_start failed: %s", esp_err_to_name(err));
+        return err;
+    }
+    ESP_LOGI(TAG, "WiFi enabled");
+    if (s_saved_valid) {
+        return sta_connect_saved();   /* 自动重连已保存的 AP */
+    }
+    return ESP_OK;
+}
+
+bool wifi_is_enabled(void)
+{
+    return s_wifi_enabled;
 }
 
 esp_err_t wifi_scan_init(void)
@@ -299,9 +339,17 @@ esp_err_t wifi_scan_init(void)
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
+    /* NCM 网关常供电使用，关闭 WiFi 省电 modem sleep，避免吞吐被周期性唤醒拖低 */
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
 
     s_scan_sem = xSemaphoreCreateBinary();
-    xTaskCreate(wifi_scan_task, "wifiscan", 5120, NULL, 3, NULL);
+    /* 栈放 PSRAM 省内部 RAM；扫描任务只在事件回调里跑，不碰 flash cache 禁用期。 */
+    BaseType_t ok = xTaskCreateWithCaps(wifi_scan_task, "wifiscan", 5120, NULL, 3,
+                                        NULL, MALLOC_CAP_SPIRAM);
+    if (ok != pdPASS) {
+        ESP_LOGW(TAG, "PSRAM 栈分配失败，回退内部 RAM");
+        xTaskCreate(wifi_scan_task, "wifiscan", 5120, NULL, 3, NULL);
+    }
     ESP_LOGI(TAG, "wifi scan ready (scan on demand)");
     return ESP_OK;
 }

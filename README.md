@@ -87,7 +87,31 @@ idf.py flash monitor
 - 设置页「USB模拟U盘」开关：开启后把 SD 卡通过 USB 暴露给电脑，电脑直接读写 `/sdcard` 的文件。
 - 硬件：ESP32-S3 USB OTG 用 **GPIO19(D-)/GPIO20(D+)**（第二/三版 PCB 已引出 USB 口；第三版这两脚空闲）；这两个脚与内置 USB Serial/JTAG 冲突，SDK 已关闭 USJ，调试仍走 UART0(GPIO43/44)。
 - 独占模型：U盘模式下 SD 卡交给电脑，设备端 FATFS 卸载，音乐/录音/TTS 自动暂停；关闭开关后自动重新挂载 FATFS、恢复功能。切换过程约几百 ms（SDMMC 重新初始化）。
-- 实现：`usb_msc.c` 用 `esp_tinyusb` 的 MSC（`tinyusb_msc_new_storage_sdmmc` + `MOUNT_USB`），依赖 `espressif/esp_tinyusb ^3.0.1`。切换在主循环做（不卡 LVGL 回调）。
+- 实现：`usb_msc.c` 用 `esp_tinyusb` 的 MSC（`tinyusb_msc_new_storage_sdmmc` + `MOUNT_USB`），依赖本地覆盖的 `components/esp_tinyusb`。切换在主循环做（不卡 LVGL 回调）。
+- ⚠️ U盘模式**必须传纯 MSC 描述符**（`s_msc_dev_desc`/`s_msc_cfg_desc`）：因为编译期开了 CDC/NCM/AUDIO，默认描述符变成复合设备，U盘模式下 NCM 未初始化会导致枚举时 `netd_open` / `dfifo_alloc` ASSERT FAILED。四种 USB 模式（U盘/声卡/CDC/网络）各自传纯描述符，不要删。
+
+### USB 声卡（UAC，免驱）
+- 设置页「USB声卡(免驱)」开关：开启后电脑把 ESP32 识别为标准 **USB 音频设备**（免装驱动），电脑的喇叭声音从板载功放（MAX98357A）播出，板载麦克风（INMP441）作为电脑的麦克风。
+- 规格：**16kHz / 16bit / 单声道**。喇叭端把单声道复制到左右声道；麦克风端读 32bit I2S 取高 16 位转单声道。
+- 与 U盘**二选一**（共用 USB 口）：开一个会自动关另一个，开启声卡时音乐/录音/TTS 自动暂停；切换在主循环做。
+- 实现：`usb_uac.c` + 本地组件 `components/usb_device_uac`（复用其回调框架与 UAC 描述符宏），底层用本地 `components/esp_tinyusb`（已开 `CFG_TUD_AUDIO`，装在 `components/` 覆盖 managed 版本）。两处采样率必须一致：`tusb_config.h` 的 `CFG_TUD_AUDIO_FUNC_1_MAX_SAMPLE_RATE` 与 `sdkconfig.defaults` 的 `CONFIG_UAC_SAMPLE_RATE`（均 16000）。
+- ⚠️ 该组件以 `CONFIG_USB_DEVICE_UAC_AS_PART=y` 模式编译，不自行初始化 TinyUSB/PHY，由 `usb_uac.c` 传自定义 UAC 描述符给 `esp_tinyusb`；I2S0(功放)/I2S1(麦克风)在 UAC 期间由本模块独占。
+- 音量：由**电脑**音量面板控制（组件把 -50~0dB 映射成 0~100），`usb_uac.c` 对 PCM 做平方律数字增益；MAX98357A 无硬件音量寄存器。设置页的「喇叭音量」只管本地播放，对声卡无效。
+
+### USB 调试串口（CDC）
+- 设置页「USB调试串口」开关：开启后电脑出现一个 **COM 口**（免驱），用于调试与上位机控制。
+- **ESP_LOG 日志镜像**：开启后所有 `ESP_LOGx` 日志会同时输出到 USB CDC（原 UART0 照常保留），COM 口就是完整调试日志口——和串口看到的内容一样。实现用 `esp_log_set_vprintf()` 钩子把日志存进静态缓冲，`cdc_task` 定期刷出（不在钩子里直接操作 USB，避免阻塞/重入）。
+- 另外：收到的文本**原样回显**；每 5 秒上报一次内部 RAM / PSRAM 空闲量。
+- 与 U盘 / 声卡**三选一互斥**（共用 USB 口），切换在主循环做。实现：`usb_cdc.c` 传纯 CDC 描述符给 `esp_tinyusb`，`CONFIG_TINYUSB_CDC_ENABLED=y` + `COUNT=1`。
+
+### USB 网络共享（NCM）
+- 设置页「USB网络共享」开关：开启后电脑插 USB 出现一块网卡，**经 ESP32 的 WiFi STA 上网**（相当于 USB 网卡）。
+- 前提：先连上 WiFi（设置页 WiFi 已连接），否则启动会失败并提示。
+- 实现：`usb_ncm.c` 用 **NAPT 网关**模式（不是 L2 桥）——USB NCM 创建独立 netif（192.168.4.1/24 + DHCP server），电脑拿 192.168.4.x；`esp_netif_napt_enable()` 把 USB 子网流量经 WiFi STA 转发出去。电脑和设备**各用独立 IP**，互不干扰。
+- 为什么不用 L2 桥：L2 桥共用 WiFi STA 的 MAC/IP，设备自己收不到 DNS 响应（`getaddrinfo` EAI_AGAIN / 202），或两边 TCP 栈抢同一个 IP 导致都没网（电脑显示 0 bps）。NAPT 是标准"网络共享"方案，设备自己联网不受影响。
+- ⚠️ 两个版本差异坑：① MAC 字符串索引必须对齐 `STRID_MAC=7`，由 `tinyusb_net_init()` 内部写 ASCII MAC，不要自己构造 UTF-16LE（会被 `strnlen` 截断成空串，枚举卡住）；② 新版 TinyUSB 的 NCM 不调用 `tud_network_init_cb()`，`on_init_callback` 不触发，改用 `ncm_monitor_task` 轮询 `tud_mounted()` 报告枚举状态。
+- 与 U盘 / 声卡 / CDC **四选一互斥**（共用 USB 口），切换在主循环做。NTB buffer：OUT=1×2048，IN=3×2048（IN 少于 3 会疯狂丢包）。发送缓冲满的丢包日志降频为每 100 次汇总一次。USB Full Speed 带宽上限 ~1MB/s，大流量场景仍受限。
+- 配置：`CONFIG_LWIP_IP_FORWARD=y` + `CONFIG_LWIP_IPV4_NAPT=y` + `CONFIG_TINYUSB_NET_MODE_NCM=y` + NCM buffer（sdkconfig.defaults 持久化）。
 
 ### 图片查看
 - 支持 **JPG / PNG**；**不支持 BMP**。

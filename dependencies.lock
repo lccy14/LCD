@@ -1,19 +1,9 @@
 dependencies:
-  espressif/esp_tinyusb:
-    component_hash: 0bd9c57b7d17a45336a54949fe49f728c405b6775239dacebed818231d474929
-    dependencies:
-    - name: idf
-      require: private
-      version: '>=5.3'
+  esp_tinyusb:
+    dependencies: []
     source:
-      registry_url: https://components.espressif.com/
-      type: service
-    targets:
-    - esp32s2
-    - esp32s3
-    - esp32p4
-    - esp32h4
-    - esp32s31
+      path: components\esp_tinyusb
+      type: local
     version: 3.0.1
   idf:
     source:
@@ -30,6 +20,6 @@ direct_dependencies:
 - espressif/esp_tinyusb
 - idf
 - lvgl/lvgl
-manifest_hash: 304b97d5fd9db1f6a8ce45ccbfdf2da2f2c1fdb22a93109cd44bb33da49e15d8
+manifest_hash: c8e2c2d864a5dcc5ed63d7ccd86b41e0a48219746d922de1f069b213ae609949
 target: esp32s3
 version: 3.0.0

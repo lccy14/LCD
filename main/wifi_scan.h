@@ -37,7 +37,11 @@ extern char g_wifi_ip[16];       /* 已连接时的 IP（点分十进制），�
 /* 初始化 WiFi station 并启动后台扫描任务（不自动周期扫描） */
 esp_err_t wifi_scan_init(void);
 
-/* 触发一次扫描（按钮点击时调用） */
+/* WiFi 总开关：关=esp_wifi_stop() 并清空状态；开=esp_wifi_start() 并重连已保存 AP */
+esp_err_t wifi_set_enabled(bool enable);
+bool      wifi_is_enabled(void);
+
+/* 触发一次扫描（仅在 WiFi 已启用时生效） */
 void wifi_scan_trigger(void);
 
 /* 注意：不要把这些函数命名成 wifi_sta_connect / wifi_sta_disconnect！

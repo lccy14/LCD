@@ -2,6 +2,7 @@
 
 #include "esp_log.h"
 #include "esp_bt.h"
+#include "esp_heap_caps.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "host/ble_hs.h"
@@ -26,6 +27,9 @@ static SemaphoreHandle_t s_host_sync_sem = NULL;
 static volatile bool s_host_synced = false;
 static uint16_t s_conn_handle = 0;
 static bool s_connected = false;
+static bool s_ble_enabled = false;      /* 默认关：开机不初始化 BLE */
+static bool s_ble_initialized = false;
+static bool s_scan_pending = false;     /* 主机未同步前的扫描请求 */
 
 /* ---------------- 工具函数 ---------------- */
 
@@ -155,6 +159,11 @@ static void on_sync(void)
     if (s_host_sync_sem) {
         xSemaphoreGive(s_host_sync_sem);
     }
+    /* 打开 BLE 后立即进蓝牙 App 时，扫描请求可能早于 host sync 到达 */
+    if (s_scan_pending) {
+        s_scan_pending = false;
+        if (s_scan_sem) xSemaphoreGive(s_scan_sem);
+    }
     ESP_LOGI(TAG, "NimBLE host synced");
 }
 
@@ -171,6 +180,8 @@ static void start_scan(void)
         ESP_LOGW(TAG, "start_scan: host not synced yet");
         return;
     }
+    s_scan_pending = false;
+    if (!s_ble_enabled) return;
 
     /* 先停止已有扫描 */
     ble_gap_disc_cancel();
@@ -229,6 +240,7 @@ static void ble_host_task(void *param)
 
 esp_err_t ble_scan_init(void)
 {
+    if (s_ble_initialized) return ESP_OK;
     esp_err_t ret;
 
     /* 释放经典蓝牙内存（只用 BLE） */
@@ -242,6 +254,7 @@ esp_err_t ble_scan_init(void)
         return ret;
     }
     ESP_LOGI(TAG, "nimble_port_init ok");
+    s_ble_initialized = true;
 
     /* 注册回调 */
     ble_hs_cfg.reset_cb = on_reset;
@@ -254,15 +267,52 @@ esp_err_t ble_scan_init(void)
     /* 启动主机任务（处理 NimBLE 事件） */
     nimble_port_freertos_init(ble_host_task);
 
-    /* 启动扫描任务 */
-    xTaskCreate(ble_scan_task, "ble_scan", 4096, NULL, 5, NULL);
+    /* 启动扫描任务。栈放 PSRAM 省内部 RAM；NimBLE 栈已在 defaults 里配成走 PSRAM。 */
+    BaseType_t ok = xTaskCreateWithCaps(ble_scan_task, "ble_scan", 4096, NULL, 5,
+                                        NULL, MALLOC_CAP_SPIRAM);
+    if (ok != pdPASS) {
+        ESP_LOGW(TAG, "PSRAM 栈分配失败，回退内部 RAM");
+        xTaskCreate(ble_scan_task, "ble_scan", 4096, NULL, 5, NULL);
+    }
 
     ESP_LOGI(TAG, "BLE scan initialized");
     return ESP_OK;
 }
 
+esp_err_t ble_scan_set_enabled(bool enable)
+{
+    if (!enable) {
+        s_ble_enabled = false;
+        s_scan_pending = false;
+        if (s_ble_initialized && s_host_synced) {
+            ble_gap_disc_cancel();
+        }
+        g_ble_dev_count = 0;
+        g_ble_dev_updated = false;
+        g_ble_state = BLE_STATE_IDLE;
+        ESP_LOGI(TAG, "BLE disabled (scan stopped)");
+        return ESP_OK;
+    }
+
+    esp_err_t err = ble_scan_init();
+    if (err != ESP_OK) return err;
+    s_ble_enabled = true;
+    ESP_LOGI(TAG, "BLE enabled");
+    return ESP_OK;
+}
+
+bool ble_scan_is_enabled(void)
+{
+    return s_ble_enabled;
+}
+
 void ble_scan_trigger(void)
 {
+    if (!s_ble_enabled) return;
+    if (!s_host_synced) {
+        s_scan_pending = true;
+        return;
+    }
     if (s_scan_sem) {
         xSemaphoreGive(s_scan_sem);
     }

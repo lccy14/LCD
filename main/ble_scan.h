@@ -34,10 +34,15 @@ typedef enum {
 extern volatile ble_state_t g_ble_state;
 extern char g_ble_conn_name[32];   /* 当前连接/正在连接的设备名 */
 
-/* 初始化 NimBLE 主机并启动后台扫描任务 */
+/* 初始化 NimBLE 主机并启动后台扫描任务（内部使用，开机默认不调用） */
 esp_err_t ble_scan_init(void);
 
-/* 触发一次扫描（进入蓝牙界面时调用） */
+/* 蓝牙总开关：关=取消扫描且不初始化；开=按需初始化 NimBLE。
+ * 本工程默认关闭，进入蓝牙 App 或设置页开关打开时才初始化。 */
+esp_err_t ble_scan_set_enabled(bool enable);
+bool      ble_scan_is_enabled(void);
+
+/* 触发一次扫描（仅在 BLE 已启用时生效） */
 void ble_scan_trigger(void);
 
 /* 连接指定设备（按 MAC 地址匹配） */

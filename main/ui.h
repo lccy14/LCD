@@ -28,7 +28,8 @@ typedef enum {
     APP_FILES,
     APP_SYSINFO,
     APP_TIMER,
-    APP_AI_CHAT
+    APP_AI_CHAT,
+    APP_LOG
 } app_id_t;
 
 /* 打开某个 App 界面：带屏幕切换动画（当前用的是 MOVE_LEFT，两屏一起左移） */
